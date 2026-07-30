@@ -1,48 +1,46 @@
-# Initializable Application Configuration
+# Initializable Config File
 
-#configuration #initialization #environment #security
+#configuration #initialization #security #runtime
 
-This application provides a command for creating its initial environment configuration file.
+Use this trait when an app should be able to create its own first-run configuration.
 
-The initialization command should resemble:
+## Command Contract
 
-```text
-app config init --path ./runtime/app.env
+Provide an init command that writes the environment file:
+
+```sh
+app init -env config/.env
 ```
 
 The command should:
 
-- create the parent directory when it does not exist
-- refuse to overwrite an existing file unless `--force` is supplied
-- generate secure random values for secrets when practical
-- write safe development defaults for ordinary configuration
-- clearly mark values that still require manual input
-- create the file with restrictive permissions when the operating system supports them
+- create the parent `config` directory when missing
+- create sibling runtime directories such as `data` and `public/uploads`
+- refuse to overwrite an existing env file by default
+- generate secure random session secrets
+- write safe local-development defaults
+- mark values that should be changed before production use
+- create the env file with restrictive permissions when the OS supports it
+- initialize or migrate the SQLite database after writing config
 
-An initialized configuration might contain:
+## Default Env Shape
+
+The generated file should follow the project-owned runtime layout:
 
 ```env
-PORT=8080
-DATABASE_PATH=/data/app.sqlite
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD=REPLACE_ME
-SESSION_SECRET=generated-random-value
+ADMIN_PASSWORD=change-me-now
+SESSION_SECRET=<generated-secret>
+DB_PATH=../data/main.sqlite
+ADDR=:8080
+ACCENT_COLOR=#35d07f
 ```
 
-The generated file must not be added to Git.
+Add app-specific settings as needed. Keep paths relative to `config/.env` when the file belongs in `./config`.
 
-The project should include a committed example file such as:
+## Safety Rules
 
-```text
-app.env.example
-```
+The init command must not print generated secrets after writing the file. It may print the path it created and the next command to run.
 
-The example file documents every supported setting but contains no working production secrets.
+Generated env files must be Git-ignored. A committed example file is useful, but it must not contain working production credentials.
 
-The application should also provide a validation command:
-
-```text
-app config check --config ./runtime/app.env
-```
-
-This command validates configuration without starting the server.

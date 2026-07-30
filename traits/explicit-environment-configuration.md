@@ -1,40 +1,45 @@
-# Explicit Environment Configuration
+# Explicit Env File Startup
 
 #configuration #environment #startup #docker
 
-This application loads its runtime configuration from an explicitly selected environment file rather than automatically searching the working directory for `.env`.
+Use this trait when the application should always start from a named environment file instead of silently searching the working directory.
 
-The application must accept:
+## Startup Contract
 
-```text
---config=/path/to/app.env
+The server command must accept an explicit env file path:
+
+```sh
+app serve -env config/.env
 ```
 
-The application should follow this startup sequence:
+Startup should:
 
-1. Parse the `--config` argument.
-2. Open the specified file.
-3. Parse its environment-style key-value pairs.
-4. Validate all required values.
-5. Refuse to start when configuration is missing or invalid.
-6. Start the application only after validation succeeds.
+1. Parse the `-env` argument.
+2. Read the selected file.
+3. Parse environment-style `KEY=value` pairs.
+4. Validate every required setting.
+5. Resolve relative paths against the env file directory.
+6. Create required parent directories when appropriate.
+7. Run database migrations.
+8. Start the server only after validation succeeds.
 
-The application must not silently load `.env` from the current directory. The selected configuration source should always be visible in the startup command.
+## Required Behavior
 
-The application may use a conventional default path such as:
-
-```text
-/config/app.env
-```
-
-However, `--config` should remain available so the path can be overridden during development, testing, or deployment.
-
-Configuration errors should identify the missing or invalid key without printing sensitive values.
-
-Example:
+Missing or invalid configuration should fail fast with a specific key name:
 
 ```text
-configuration error: ADMIN_PASSWORD is required
+ADMIN_PASSWORD is required in config/.env
 ```
 
-The application may log the configuration file path and non-sensitive settings, but it must never log passwords, tokens, private keys, session secrets, or other credentials.
+Do not print passwords, session secrets, API keys, tokens, private keys, or full credential URLs.
+
+## Docker Rule
+
+Docker startup should use the same explicit env file:
+
+```sh
+app serve -env config/.env
+```
+
+If `config/.env` is missing inside the container, the Docker command may run the init command first. After initialization, the server should still start from the explicit env path.
+

@@ -83,8 +83,10 @@ type PageData struct {
 func main() {
 	log.SetFlags(0)
 	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+		if err := runServe([]string{"-env", ".env"}); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	switch os.Args[1] {
@@ -104,13 +106,14 @@ func main() {
 
 func usage() {
 	fmt.Println("usage:")
-	fmt.Println("  trait init -env /path/to/trait.env")
-	fmt.Println("  trait serve -env /path/to/trait.env")
+	fmt.Println("  trait")
+	fmt.Println("  trait init -env /path/to/.env")
+	fmt.Println("  trait serve -env /path/to/.env")
 }
 
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	envPath := fs.String("env", ".env", "path to write the env file")
+	envPath := fs.String("env", "config/.env", "path to write the env file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -118,21 +121,41 @@ func runInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(absOrClean(*envPath)), 0o755); err != nil {
+	absEnv := absOrClean(*envPath)
+	envDir := filepath.Dir(absEnv)
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		return err
+	}
+	dbPath := resolveRelative(envDir, "../data/main.sqlite")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(resolveRelative(envDir, "../public/uploads"), 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(resolveRelative(envDir, "../traits"), 0o755); err != nil {
 		return err
 	}
 	content := fmt.Sprintf(`ADMIN_USERNAME=admin
 ADMIN_PASSWORD=change-me-now
 SESSION_SECRET=%s
-DB_PATH=trait.sqlite
-TRAITS_DIR=traits
-ADDR=:8080
+DB_PATH=../data/main.sqlite
+TRAITS_DIR=../traits
+ADDR=:6688
 ACCENT_COLOR=#35d07f
 `, secret)
 	if _, err := os.Stat(*envPath); err == nil {
 		return fmt.Errorf("%s already exists", *envPath)
 	}
 	if err := os.WriteFile(*envPath, []byte(content), 0o600); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
 		return err
 	}
 	fmt.Printf("created %s\n", *envPath)
@@ -146,7 +169,7 @@ func runServe(args []string) error {
 		return err
 	}
 	if *envPath == "" {
-		return errors.New("serve requires -env /path/to/trait.env")
+		return errors.New("serve requires -env /path/to/.env")
 	}
 
 	cfg, err := loadConfig(*envPath)
@@ -154,6 +177,9 @@ func runServe(args []string) error {
 		return err
 	}
 	if err := os.MkdirAll(cfg.TraitsDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil {
 		return err
 	}
 	db, err := sql.Open("sqlite3", cfg.DBPath)
@@ -173,7 +199,8 @@ func runServe(args []string) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/controls", app.controls)
-	mux.HandleFunc("/", app.publicIndex)
+	mux.HandleFunc("/", app.showcase)
+	mux.HandleFunc("/traits", app.publicTraits)
 	mux.HandleFunc("/traits/", app.publicTrait)
 	mux.HandleFunc("/login", app.login)
 	mux.HandleFunc("/logout", app.logout)
@@ -209,7 +236,11 @@ func loadConfig(envPath string) (Config, error) {
 		AccentColor:   values["ACCENT_COLOR"],
 	}
 	if cfg.Addr == "" {
-		cfg.Addr = ":8080"
+		if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+			cfg.Addr = ":" + strings.TrimPrefix(port, ":")
+		} else {
+			cfg.Addr = ":6688"
+		}
 	}
 	if cfg.AccentColor == "" {
 		cfg.AccentColor = "#35d07f"
@@ -228,7 +259,7 @@ func loadConfig(envPath string) (Config, error) {
 	}
 	cfg.DBPath = resolveRelative(base, cfg.DBPath)
 	cfg.TraitsDir = resolveRelative(base, cfg.TraitsDir)
-	cfg.LogoPath = filepath.Join(base, "logo.png")
+	cfg.LogoPath = resolveAssetPath(base, "logo.png")
 	return cfg, nil
 }
 
@@ -267,8 +298,21 @@ ON login_failures (ip, attempted_at);
 	return err
 }
 
-func (a *App) publicIndex(w http.ResponseWriter, r *http.Request) {
+func (a *App) showcase(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	traits, tags, err := a.loadTraits()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	render(w, "showcase", PageData{Config: a.cfg, Traits: traits, Trait: featuredTrait(traits), Tags: tags, IsAuthed: a.isAuthed(r), BodyClass: "showcase-page"})
+}
+
+func (a *App) publicTraits(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/traits" {
 		http.NotFound(w, r)
 		return
 	}
@@ -312,7 +356,7 @@ func (a *App) publicTrait(w http.ResponseWriter, r *http.Request) {
 	if search != "" {
 		traits = searchTraits(traits, search)
 	}
-	render(w, "trait", PageData{Config: a.cfg, Traits: traits, Trait: trait, Tags: tags, ActiveTag: active, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page"})
+	render(w, "trait", PageData{Config: a.cfg, Traits: traits, Trait: trait, Tags: tags, ActiveTag: active, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page detail-page"})
 }
 
 func (a *App) controls(w http.ResponseWriter, r *http.Request) {
@@ -687,6 +731,18 @@ func searchTraits(traits []Trait, query string) []Trait {
 	return out
 }
 
+func featuredTrait(traits []Trait) Trait {
+	for _, trait := range traits {
+		if trait.Slug == "application-control-system" {
+			return trait
+		}
+	}
+	if len(traits) > 0 {
+		return traits[0]
+	}
+	return Trait{}
+}
+
 func render(w http.ResponseWriter, name string, data PageData) {
 	tpl := template.Must(template.New("base").Funcs(template.FuncMap{
 		"joinTags": func(tags []string) string {
@@ -721,9 +777,9 @@ func render(w http.ResponseWriter, name string, data PageData) {
 				values.Set("q", search)
 			}
 			if encoded := values.Encode(); encoded != "" {
-				return "/?" + encoded
+				return "/traits?" + encoded
 			}
-			return "/"
+			return "/traits"
 		},
 	}).Parse(templates))
 	if err := tpl.ExecuteTemplate(w, name, data); err != nil {
@@ -783,6 +839,20 @@ func resolveRelative(base, path string) string {
 	return filepath.Join(base, path)
 }
 
+func resolveAssetPath(envDir, name string) string {
+	candidates := []string{
+		filepath.Join(envDir, name),
+		filepath.Join(filepath.Dir(envDir), name),
+		filepath.Join(".", name),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return filepath.Join(filepath.Dir(envDir), name)
+}
+
 func absOrClean(path string) string {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -838,33 +908,37 @@ const templates = `
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body class="{{.BodyClass}}">
+  <div class="asset-loading" role="status" aria-live="polite">Loading...</div>
   <header class="topbar">
     <a class="brand" href="/">
       <img src="/assets/logo-nav.png" alt="trait" width="180" height="54">
     </a>
-    {{if .IsAuthed}}
+    <nav class="topnav" aria-label="Primary navigation">
+      <a href="/traits">Browse traits</a>
+      {{if .IsAuthed}}<a href="/admin">Admin</a><a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
+    </nav>
     <button class="menu-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-menu" data-menu-open>
       <span></span><span></span><span></span>
     </button>
-    {{end}}
   </header>
-  {{if .IsAuthed}}
   <div class="menu-overlay" data-menu-close></div>
   <nav class="side-menu" id="site-menu" aria-label="Primary navigation">
     <div class="side-menu-head">
       <span>Navigation</span>
       <button class="menu-close" type="button" aria-label="Close navigation" data-menu-close>&times;</button>
     </div>
-    <a href="/">Public</a>
+    <a href="/">Showcase</a>
+    <a href="/traits">Traits</a>
     <a href="/admin">Admin</a>
-    <a href="/logout">Logout</a>
+    {{if .IsAuthed}}<a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
   </nav>
-  {{end}}
   <main>{{end}}
 
 {{define "bottom"}}</main>
 <script>
 (function () {
+  document.body.classList.add("assets-ready");
+
   var menu = document.querySelector("[data-menu-open]");
   var closeTargets = Array.prototype.slice.call(document.querySelectorAll("[data-menu-close]"));
 
@@ -897,24 +971,25 @@ const templates = `
   var statusEl = document.querySelector("[data-cart-status]");
   var searchInput = document.querySelector("[data-trait-search]");
   var emptyEl = document.querySelector("[data-search-empty]");
+  var searchItems = Array.prototype.slice.call(document.querySelectorAll("[data-search]"));
 
   cards.forEach(function (card) {
     var item = traitFromElement(card);
     if (item.slug && cart[item.slug]) {
       cart[item.slug] = Object.assign({}, cart[item.slug] || {}, item);
     }
-    var checkbox = card.querySelector("[data-cart-toggle]");
-    if (!checkbox) return;
-    checkbox.checked = Boolean(cart[item.slug]);
-    checkbox.addEventListener("change", function () {
-      if (checkbox.checked) {
-        cart[item.slug] = item;
-      } else {
-        delete cart[item.slug];
-      }
-      persist();
-      renderCart();
-    });
+    var toggle = card.querySelector("[data-cart-toggle]");
+    if (toggle) {
+      toggle.addEventListener("click", function () {
+        toggleTrait(item);
+      });
+    }
+    if (card.classList.contains("trait-list-item")) {
+      card.addEventListener("click", function (event) {
+        if (event.target.closest("a, button")) return;
+        toggleTrait(item);
+      });
+    }
   });
 
   Array.prototype.slice.call(document.querySelectorAll("[data-copy-trait]")).forEach(function (button) {
@@ -951,10 +1026,6 @@ const templates = `
   if (clearBtn) {
     clearBtn.addEventListener("click", function () {
       cart = {};
-      cards.forEach(function (card) {
-        var checkbox = card.querySelector("[data-cart-toggle]");
-        if (checkbox) checkbox.checked = false;
-      });
       persist();
       renderCart();
       setStatus("Cart cleared.");
@@ -1020,15 +1091,14 @@ const templates = `
     }
     if ((key === "b" || key === "t" || key === "Escape") && window.location.pathname === "/controls") {
       event.preventDefault();
-      window.location.href = "/";
+      window.location.href = "/traits";
     }
   }
 
   function filterVisibleTraits() {
     var query = (searchInput.value || "").trim().toLowerCase();
     var visible = 0;
-    cards.forEach(function (card) {
-      if (!card.hasAttribute("data-search")) return;
+    searchItems.forEach(function (card) {
       var matched = !query || (card.getAttribute("data-search-text") || "").toLowerCase().indexOf(query) !== -1;
       card.hidden = !matched;
       if (matched) visible++;
@@ -1043,8 +1113,8 @@ const templates = `
   }
 
   function visibleListItems() {
-    return cards.filter(function (card) {
-      return card.hasAttribute("data-search") && !card.hidden;
+    return Array.prototype.slice.call(document.querySelectorAll(".trait-list-item[data-search]")).filter(function (card) {
+      return !card.hidden;
     });
   }
 
@@ -1081,6 +1151,11 @@ const templates = `
     if (!current) return;
     var item = traitFromElement(current);
     if (!item.slug) return;
+    toggleTrait(item);
+  }
+
+  function toggleTrait(item) {
+    if (!item || !item.slug) return;
     if (cart[item.slug]) {
       delete cart[item.slug];
       setStatus("Removed " + (item.title || "trait") + ".");
@@ -1144,8 +1219,14 @@ const templates = `
     if (countEl) countEl.textContent = String(count);
     if (checkoutBtn) checkoutBtn.disabled = count === 0;
     cards.forEach(function (card) {
-      var checkbox = card.querySelector("[data-cart-toggle]");
-      if (checkbox) checkbox.checked = Boolean(cart[card.getAttribute("data-slug") || ""]);
+      var selected = Boolean(cart[card.getAttribute("data-slug") || ""]);
+      card.classList.toggle("selected", selected);
+      card.setAttribute("aria-selected", selected ? "true" : "false");
+      var toggle = card.querySelector("[data-cart-toggle]");
+      if (toggle) {
+        toggle.setAttribute("aria-pressed", selected ? "true" : "false");
+        toggle.textContent = selected ? "Selected" : "Select trait";
+      }
     });
     document.body.classList.toggle("has-cart", count > 0);
   }
@@ -1187,15 +1268,70 @@ const templates = `
 
 {{define "tags"}}
   <div class="tags">
-    <a class="tag {{if eq .ActiveTag ""}}active{{end}}" href="/">all</a>
-    {{range .Tags}}<a class="tag {{if eq $.ActiveTag .}}active{{end}}" href="/?tag={{.}}">#{{.}}</a>{{end}}
+    <a class="tag {{if eq .ActiveTag ""}}active{{end}}" href="/traits">all</a>
+    {{range .Tags}}<a class="tag {{if eq $.ActiveTag .}}active{{end}}" href="/traits?tag={{.}}">#{{.}}</a>{{end}}
   </div>
 {{end}}
+
+{{define "contentTags"}}
+  <div class="content-tags">
+    {{range .}}<span class="content-tag">#{{.}}</span>{{else}}<span class="content-tag">untagged</span>{{end}}
+  </div>
+{{end}}
+
+{{define "showcase"}}{{template "top" .}}
+  <section class="showcase-hero">
+    <div class="showcase-copy">
+      <p class="eyebrow">Trait library for application patterns</p>
+      <h1>Reusable patterns for better applications.</h1>
+      <p>A focused library of reusable implementation patterns for building application infrastructure, UI shells, deployment workflows, and operational guardrails.</p>
+      <div class="hero-actions">
+        <a class="button" href="/traits">Browse traits</a>
+        {{if .Trait.Slug}}<a class="text-link" href="/traits/{{.Trait.Slug}}">View featured trait</a>{{end}}
+      </div>
+    </div>
+    <div class="showcase-panel" aria-label="Featured trait preview">
+      <div class="panel-head">
+        <span>Featured trait</span>
+        {{if .Trait.Slug}}<a href="/traits/{{.Trait.Slug}}">Read trait</a>{{end}}
+      </div>
+      <div class="featured-trait">
+        {{if .Trait.Slug}}
+          {{template "contentTags" .Trait.Tags}}
+          <h2>{{.Trait.Title}}</h2>
+          <p>Reusable guidance stored as markdown, ready to read, select, and copy into an implementation brief.</p>
+          <div class="featured-meta"><span>Markdown source</span><span>{{len .Trait.Tags}} tags</span></div>
+          <a class="button secondary" href="/traits/{{.Trait.Slug}}">Open trait</a>
+        {{else}}
+          <p class="empty">No traits have been published yet.</p>
+        {{end}}
+      </div>
+    </div>
+  </section>
+  <section class="showcase-band">
+    <article>
+      <span class="feature-icon" aria-hidden="true">R</span>
+      <h2>Reusable patterns</h2>
+      <p>Traits describe complete implementation behaviors you can bring into new or existing applications.</p>
+    </article>
+    <article>
+      <span class="feature-icon" aria-hidden="true">F</span>
+      <h2>Fast browsing</h2>
+      <p>The dedicated trait browser supports search, tags, focused reading, and copying selected traits.</p>
+    </article>
+    <article>
+      <span class="feature-icon" aria-hidden="true">M</span>
+      <h2>Markdown source</h2>
+      <p>Each trait is plain markdown, so the guidance remains portable, reviewable, and easy to evolve.</p>
+    </article>
+  </section>
+{{template "bottom" .}}{{end}}
 
 {{define "browser"}}
   <section class="browser-shell">
     <div class="browser-toolbar">
       <div>
+        <p class="eyebrow">Library</p>
         <h1>Traits</h1>
         <p>Search, read, select, and copy reusable application traits.</p>
       </div>
@@ -1203,24 +1339,35 @@ const templates = `
     </div>
     <section class="trait-browser">
     <aside class="library-panel" aria-label="Trait library">
-      <form class="search" method="get" action="/">
+      <div class="sidebar-head">
+        <h2>Library</h2>
+        <span>{{len .Traits}} results</span>
+      </div>
+      <form class="search" method="get" action="/traits">
         {{if .ActiveTag}}<input type="hidden" name="tag" value="{{.ActiveTag}}">{{end}}
         <label>Search traits<input data-trait-search name="q" value="{{.Search}}" type="search" placeholder="Search title, tag, or markdown" autocomplete="off"></label>
-        <button class="button" type="submit">Search</button>
+        <button class="button secondary" type="submit">Search</button>
       </form>
+      <div class="filter-head"><span>Tags</span>{{if or .ActiveTag .Search}}<a href="/traits">Reset</a>{{end}}</div>
       {{template "tags" .}}
+    </aside>
+    <section class="results-panel" aria-label="Trait results">
+      <div class="list-toolbar">
+        <span>{{len .Traits}} results</span>
+        <div class="bulk-actions">
+          <span><strong data-cart-count>0</strong> selected</span>
+          <button class="secondary" type="button" data-cart-clear>Clear</button>
+          <button class="button" type="button" data-cart-checkout disabled>Copy selected</button>
+        </div>
+      </div>
       <div class="trait-list">
         {{range .Traits}}
           <article class="trait-list-item {{if eq $.Trait.Slug .Slug}}active{{end}}" data-trait data-search data-slug="{{.Slug}}" data-title="{{.Title}}" data-content="{{.Content}}" data-search-text="{{.Title}} {{joinTags .Tags}} {{.Content}}">
-            <label class="pick">
-              <input data-cart-toggle type="checkbox" aria-label="Add {{.Title}} to cart">
-              <span>Add</span>
-            </label>
             <a class="trait-link" href="{{traitURL .Slug $.ActiveTag $.Search}}">
-              <span class="meta">{{joinTags .Tags}}</span>
               <strong>{{.Title}}</strong>
+              {{template "contentTags" .Tags}}
             </a>
-            <button class="icon-button" type="button" data-copy-trait aria-label="Copy {{.Title}}">Copy</button>
+            <button class="icon-button" type="button" data-copy-trait aria-label="Copy {{.Title}}" title="Copy trait">Copy</button>
           </article>
 		{{end}}
 		{{if .Traits}}<p class="empty" data-search-empty hidden>No traits match that search.</p>{{end}}
@@ -1228,21 +1375,19 @@ const templates = `
 			{{if .Search}}<p class="empty">No traits match that search.</p>{{else}}<p class="empty">No traits found.</p>{{end}}
 		{{end}}
 	</div>
-    </aside>
+    </section>
     <article class="doc reader-panel" data-trait data-slug="{{.Trait.Slug}}" data-title="{{.Trait.Title}}" data-content="{{.Trait.Content}}">
       {{if .Trait.Slug}}
-        <div class="reader-actions">
+        <header class="reader-head">
           <a class="back-link" href="{{libraryURL .ActiveTag .Search}}">Back to library</a>
+          <h1>{{.Trait.Title}}</h1>
+          {{template "contentTags" .Trait.Tags}}
           <div>
-            <label class="pick detail-pick">
-              <input data-cart-toggle type="checkbox" aria-label="Add {{.Trait.Title}} to cart">
-              <span>Add</span>
-            </label>
+            <button class="button secondary select-toggle" type="button" data-cart-toggle aria-pressed="false">Select trait</button>
             <button class="button secondary" type="button" data-copy-trait>Copy trait</button>
           </div>
-        </div>
-        <div class="meta">{{joinTags .Trait.Tags}}</div>
-        {{.Trait.HTML}}
+        </header>
+        <div class="article-body">{{.Trait.HTML}}</div>
       {{else}}
         <p class="empty">Select a trait to read it.</p>
       {{end}}
@@ -1250,10 +1395,7 @@ const templates = `
     </section>
   </section>
   <aside class="cart-bar" aria-live="polite">
-    <div><strong data-cart-count>0</strong> selected</div>
     <p data-cart-status></p>
-    <button class="secondary" type="button" data-cart-clear>Clear</button>
-    <button class="button" type="button" data-cart-checkout disabled>Copy selected</button>
   </aside>
 {{end}}
 
@@ -1271,7 +1413,7 @@ const templates = `
       <h1>Controls</h1>
       <p>Keyboard controls for moving through the trait library quickly.</p>
     </div>
-    <a class="button secondary" href="/">Back to library</a>
+    <a class="button secondary" href="/traits">Back to library</a>
   </section>
   <section class="controls-grid" aria-label="Keyboard controls">
     <article>
@@ -1334,51 +1476,84 @@ const templates = `
 {{template "bottom" .}}{{end}}
 
 {{define "admin"}}{{template "top" .}}
-  <section class="section-head">
+  <section class="section-head admin-head">
     <div>
-      <h1>Admin</h1>
-      <p>Traits are markdown files. Add tags anywhere as #auth, #db, #ui, or any label you need.</p>
+      <h1>Trait administration</h1>
+      <p>Manage the markdown source files behind the public Trait library.</p>
     </div>
     <a class="button" href="/admin/new">New trait</a>
   </section>
-  {{template "tags" .}}
-  <section class="list">
+  <section class="admin-toolbar" aria-label="Trait administration tools">
+    <label>Search traits<input data-trait-search type="search" placeholder="Search title, tag, or markdown" autocomplete="off"></label>
+    <span>{{len .Traits}} traits</span>
+  </section>
+  <details class="admin-filters">
+    <summary>Filters</summary>
+    {{template "tags" .}}
+  </details>
+  <section class="admin-list" aria-label="Admin trait list">
+    <div class="admin-row admin-row-head" aria-hidden="true">
+      <span>Trait</span><span>Tags</span><span>Updated</span><span>Actions</span>
+    </div>
     {{range .Traits}}
-      <article class="row">
-        <div>
-          <div class="meta">{{joinTags .Tags}}</div>
+      <article class="admin-row" data-search data-search-text="{{.Title}} {{joinTags .Tags}} {{.Content}}">
+        <div class="admin-title">
           <h2><a href="/traits/{{.Slug}}">{{.Title}}</a></h2>
+          <span>{{.Slug}}</span>
         </div>
+        {{template "contentTags" .Tags}}
+        <time datetime="{{.ModTime}}">{{.ModTime.Format "Jan 2, 2006"}}</time>
         <div class="actions">
           <a class="button secondary" href="/admin/edit/{{.Slug}}">Edit</a>
-          <form method="post" action="/admin/delete/{{.Slug}}"><button class="danger" type="submit">Delete</button></form>
+          <details class="danger-menu">
+            <summary aria-label="Delete {{.Title}}">Delete</summary>
+            <form method="post" action="/admin/delete/{{.Slug}}">
+              <p>Delete <strong>{{.Title}}</strong>? This cannot be undone.</p>
+              <button class="danger" type="submit">Confirm delete</button>
+            </form>
+          </details>
         </div>
       </article>
     {{else}}
       <p class="empty">No traits yet.</p>
     {{end}}
+    {{if .Traits}}<p class="empty" data-search-empty hidden>No traits match that search.</p>{{end}}
   </section>
 {{template "bottom" .}}{{end}}
 
 {{define "edit"}}{{template "top" .}}
-  <section class="section-head"><h1>{{if .Trait.Slug}}Edit trait{{else}}New trait{{end}}</h1></section>
-  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+  <section class="section-head edit-head">
+    <div>
+      <h1>{{if .Trait.Slug}}Edit trait{{else}}New trait{{end}}</h1>
+      <p>Write the reusable guidance in markdown. Tags can be added inline with #tag-name.</p>
+    </div>
+    <a class="button secondary" href="/admin">Cancel</a>
+  </section>
   <form class="editor" method="post">
+    {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
     {{if not .Trait.Slug}}<label>Title<input name="title" value="{{.Trait.Title}}" autocomplete="off"></label>{{end}}
     <label>Markdown<textarea name="content" rows="24">{{.Trait.Content}}</textarea></label>
-    <button class="button" type="submit">Save</button>
+    <div class="form-actions"><a class="button secondary" href="/admin">Cancel</a><button class="button" type="submit">Save trait</button></div>
   </form>
 {{template "bottom" .}}{{end}}
 
 {{define "login"}}{{template "top" .}}
-  <form class="login" method="post" action="/login">
-    <img class="login-logo" src="/assets/logo.png" alt="" width="96" height="64">
-    <h1>Admin login</h1>
-    {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-    <label>Username<input name="username" autocomplete="username"></label>
-    <label>Password<input name="password" type="password" autocomplete="current-password"></label>
-    <button class="button" type="submit">Login</button>
-  </form>
+  <section class="login-shell">
+    <div class="login-note">
+      <p class="eyebrow">Trait admin</p>
+      <h1>Manage reusable application guidance.</h1>
+      <p>Keep the public library focused, current, and easy to browse from markdown source.</p>
+    </div>
+    <form class="login" method="post" action="/login">
+      <img class="login-logo" src="/assets/logo.png" alt="" width="160" height="96">
+      <h2>Welcome back</h2>
+      <p>Sign in to manage the Trait library.</p>
+      {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+      <label>Username<input name="username" autocomplete="username"></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password"></label>
+      <button class="button" type="submit">Sign in</button>
+    </form>
+  </section>
 {{template "bottom" .}}{{end}}
 `
 
@@ -1389,11 +1564,16 @@ html, body { min-height: 100%; }
 body { margin: 0; background: #050505; color: #f5f5f5; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }
 body.browser-page { height: 100vh; overflow: hidden; }
 body.has-cart main { padding-bottom: 0; }
+.asset-loading { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: #050505; color: #d8d8d8; font-weight: 750; }
+.assets-ready .asset-loading { display: none; }
 a { color: inherit; text-decoration: none; }
 a:hover { color: var(--accent); }
 .topbar { display: flex; justify-content: space-between; align-items: center; min-height: 82px; padding: 10px clamp(18px, 4vw, 48px); border-bottom: 1px solid #202020; position: sticky; top: 0; z-index: 30; background: rgba(5,5,5,.92); backdrop-filter: blur(12px); }
 .brand { color: var(--accent); font-weight: 800; font-size: 1.1rem; display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
 .brand img { width: 180px; height: 54px; object-fit: contain; display: block; flex: 0 0 180px; }
+.topnav { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.topnav a { padding: 9px 11px; border-radius: 6px; color: #d9d9d9; font-weight: 750; }
+.topnav a:hover { background: #111; color: var(--accent); }
 .menu-toggle, .menu-close { width: 42px; height: 42px; padding: 0; border-radius: 6px; background: #151515; color: #f5f5f5; border: 1px solid #303030; display: inline-grid; place-items: center; }
 .menu-toggle span { width: 18px; height: 2px; background: currentColor; display: block; }
 .menu-toggle { gap: 4px; }
@@ -1412,6 +1592,27 @@ main { width: min(1220px, calc(100% - 28px)); margin: 0 auto; padding: 42px 0 72
 .browser-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid #1c1c1c; }
 .browser-toolbar h1 { margin: 0; font-size: clamp(1.45rem, 2.8vw, 2.35rem); line-height: 1; letter-spacing: 0; }
 .browser-toolbar p { color: #bdbdbd; margin: 6px 0 0; max-width: 640px; }
+.showcase-hero { min-height: calc(100vh - 180px); display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 480px); gap: clamp(28px, 5vw, 72px); align-items: center; padding: clamp(28px, 7vw, 86px) 0; }
+.showcase-copy { max-width: 720px; }
+.eyebrow { margin: 0 0 14px; color: var(--accent); font-weight: 800; text-transform: uppercase; letter-spacing: .08em; font-size: .78rem; }
+.showcase-copy h1 { margin: 0 0 18px; font-size: clamp(4rem, 13vw, 10rem); line-height: .86; letter-spacing: 0; }
+.showcase-copy p:not(.eyebrow) { color: #d0d0d0; font-size: clamp(1.05rem, 2vw, 1.35rem); max-width: 640px; margin: 0; }
+.hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+.showcase-panel { max-height: 520px; border: 1px solid #242424; border-radius: 8px; background: #0b0b0b; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr); box-shadow: 0 24px 80px rgba(0,0,0,.34); }
+.panel-head { display: flex; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid #202020; color: #bdbdbd; font-weight: 800; }
+.panel-head a { color: var(--accent); }
+.featured-trait { min-height: 0; overflow: auto; padding: 20px; }
+.featured-trait h2 { margin: 8px 0 14px; font-size: clamp(1.35rem, 2.2vw, 2rem); line-height: 1.1; }
+.featured-doc { max-height: 250px; overflow: hidden; color: #d7d7d7; margin-bottom: 18px; position: relative; }
+.featured-doc::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 64px; background: linear-gradient(transparent, #0b0b0b); pointer-events: none; }
+.featured-doc h1 { display: none; }
+.featured-doc h2 { font-size: 1.05rem; margin: 18px 0 8px; }
+.featured-doc p, .featured-doc li { color: #d7d7d7; }
+.featured-doc pre { max-height: 150px; overflow: hidden; padding: 14px; background: #101010; border: 1px solid #242424; border-radius: 8px; }
+.showcase-band { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; padding: 28px 0 6px; border-top: 1px solid #202020; }
+.showcase-band article { min-width: 0; }
+.showcase-band h2 { margin: 0 0 8px; font-size: 1.08rem; }
+.showcase-band p { margin: 0; color: #bdbdbd; }
 .hero { padding: 24px 0 22px; border-bottom: 1px solid #1c1c1c; margin-bottom: 24px; }
 .hero h1, .section-head h1 { font-size: clamp(2rem, 5vw, 4.5rem); line-height: 1; margin: 0 0 14px; letter-spacing: 0; max-width: 850px; }
 .hero p, .section-head p { color: #bdbdbd; margin: 0; max-width: 680px; }
@@ -1430,8 +1631,9 @@ main { width: min(1220px, calc(100% - 28px)); margin: 0 auto; padding: 42px 0 72
 .search { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; margin-bottom: 8px; }
 .search label { min-width: 0; }
 .trait-list { min-height: 0; overflow: auto; display: grid; align-content: start; gap: 10px; padding-right: 4px; }
-.trait-list-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 12px; border: 1px solid #202020; border-radius: 8px; background: #0b0b0b; }
+.trait-list-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 12px; border: 1px solid #202020; border-radius: 8px; background: #0b0b0b; cursor: pointer; }
 .trait-list-item.active { border-color: var(--accent); background: #0f1411; }
+.trait-list-item.selected { border-color: rgba(54, 215, 131, .7); background: #102017; box-shadow: inset 3px 0 0 var(--accent); }
 .trait-list-item[hidden] { display: none; }
 .trait-link { display: grid; gap: 4px; min-width: 0; }
 .trait-link strong { font-size: .98rem; line-height: 1.2; overflow-wrap: anywhere; }
@@ -1456,12 +1658,7 @@ main { width: min(1220px, calc(100% - 28px)); margin: 0 auto; padding: 42px 0 72
 .button:disabled, button:disabled { cursor: not-allowed; opacity: .5; }
 .secondary { background: #1a1a1a; color: #f5f5f5; border: 1px solid #303030; }
 .danger { background: #ff4d4d; color: #160000; }
-.pick { justify-self: start; display: inline-flex; grid-auto-flow: column; align-items: center; gap: 8px; color: #e7e7e7; cursor: pointer; user-select: none; }
-.pick input { appearance: none; width: 20px; height: 20px; margin: 0; padding: 0; border-radius: 5px; border: 1px solid #3a3a3a; background: #101010; display: grid; place-items: center; }
-.pick input:checked { border-color: var(--accent); background: var(--accent); }
-.pick input:checked::after { content: ""; width: 10px; height: 6px; border: solid #031006; border-width: 0 0 2px 2px; transform: rotate(-45deg) translate(1px, -1px); }
-.pick span { font-weight: 750; font-size: .9rem; }
-.detail-pick { margin: 0; }
+.select-toggle[aria-pressed="true"] { border-color: rgba(54, 215, 131, .8); background: var(--accent-soft); color: var(--accent); }
 .cart-bar { position: fixed; left: 50%; bottom: 18px; z-index: 20; width: min(720px, calc(100% - 36px)); transform: translate(-50%, 120%); opacity: 0; pointer-events: none; transition: transform .18s ease, opacity .18s ease; display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid #252525; border-radius: 8px; background: rgba(11,11,11,.96); box-shadow: 0 18px 50px rgba(0,0,0,.48); backdrop-filter: blur(12px); }
 .has-cart .cart-bar { transform: translate(-50%, 0); opacity: 1; pointer-events: auto; }
 .cart-bar div { color: #e8e8e8; min-width: 92px; }
@@ -1482,8 +1679,15 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, C
 @media (max-width: 680px) {
   .topbar { min-height: 76px; }
   .brand img { width: 150px; height: 44px; flex-basis: 150px; }
+  .topnav { gap: 2px; }
+  .topnav a { padding: 7px 8px; font-size: .92rem; }
+  .topnav a[href="/logout"] { display: none; }
   .section-head, .row { align-items: flex-start; flex-direction: column; }
   main { width: min(100% - 28px, 1120px); padding-top: 24px; }
+  .showcase-hero { min-height: auto; grid-template-columns: 1fr; padding: 34px 0; }
+  .showcase-copy h1 { font-size: 4.6rem; }
+  .showcase-panel { min-height: 340px; }
+  .showcase-band { grid-template-columns: 1fr; gap: 20px; }
   .browser-page main { height: calc(100vh - 76px); padding: 10px 0; }
   .browser-shell { gap: 10px; }
   .browser-toolbar { align-items: flex-start; }
@@ -1495,10 +1699,738 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, C
   .search { grid-template-columns: 1fr; }
   .reader-panel { border-left: 0; border-top: 1px solid #202020; padding: 12px 0 0; }
   .reader-actions { align-items: flex-start; flex-direction: column; position: static; }
-  .trait-list-item { grid-template-columns: auto minmax(0, 1fr); }
-  .trait-list-item .icon-button { grid-column: 2; justify-self: start; }
+  .trait-list-item { grid-template-columns: minmax(0, 1fr); }
+  .trait-list-item .icon-button { justify-self: start; }
   .actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
   .cart-bar { align-items: stretch; flex-wrap: wrap; }
   .cart-bar p { flex-basis: 100%; order: 4; }
+}
+
+:root {
+  --bg: #090a0b;
+  --surface-1: #0f1113;
+  --surface-2: #15181b;
+  --surface-3: #1b1f23;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --text-primary: #f4f5f6;
+  --text-secondary: #b4bac2;
+  --text-muted: #747b84;
+  --accent: __ACCENT__;
+  --accent-hover: #48e493;
+  --accent-soft: rgba(54, 215, 131, 0.12);
+  --danger: #ff5d67;
+  --danger-hover: #ff7079;
+  --danger-soft: rgba(255, 93, 103, 0.12);
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --shadow-card: 0 20px 50px rgba(0, 0, 0, 0.28);
+  --content-max: 1440px;
+  --reading-max: 800px;
+  color-scheme: dark;
+}
+
+html { background: var(--bg); }
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.65;
+}
+
+body.browser-page { overflow: hidden; }
+.asset-loading { background: var(--bg); color: var(--text-secondary); }
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+a, button, input, textarea, select, summary { transition: background-color .18s ease, border-color .18s ease, color .18s ease, box-shadow .18s ease, transform .18s ease; }
+a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.topbar {
+  min-height: 72px;
+  width: 100%;
+  max-width: none;
+  padding: 0 max(16px, calc((100vw - var(--content-max)) / 2 + 32px));
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(9, 10, 11, .9);
+}
+.brand img { width: 166px; height: 48px; flex-basis: 166px; }
+.topnav { gap: 4px; }
+.topnav a {
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  padding: 8px 11px;
+  font-size: .9rem;
+  font-weight: 700;
+}
+.topnav a:hover { background: var(--surface-2); color: var(--text-primary); }
+.menu-toggle { display: none; }
+.side-menu { background: var(--surface-1); border-left-color: var(--border-subtle); }
+.side-menu-head { border-bottom-color: var(--border-subtle); color: var(--text-secondary); }
+.side-menu a:hover { background: var(--surface-2); border-color: var(--border-subtle); }
+
+main {
+  width: min(var(--content-max), calc(100% - 64px));
+  padding: 48px 0 72px;
+}
+.browser-page main {
+  width: 100%;
+  height: calc(100vh - 72px);
+  padding: 0;
+}
+
+.button, button {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #06100a;
+  border: 1px solid transparent;
+  padding: 10px 18px;
+  font-weight: 760;
+  line-height: 1;
+}
+.button:hover, button:hover { background: var(--accent-hover); color: #06100a; transform: translateY(-1px); }
+.secondary {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border-color: var(--border-subtle);
+}
+.secondary:hover { background: var(--surface-3); color: var(--text-primary); border-color: var(--border-strong); }
+.danger {
+  background: transparent;
+  color: var(--danger);
+  border-color: transparent;
+}
+.danger:hover { background: var(--danger-soft); color: var(--danger-hover); }
+.icon-button {
+  width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  font-size: .72rem;
+}
+.icon-button:hover { background: var(--surface-3); color: var(--text-primary); }
+
+label { color: var(--text-secondary); font-size: .86rem; font-weight: 650; }
+input, textarea, select {
+  min-height: 46px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 11px 12px;
+}
+input::placeholder, textarea::placeholder { color: var(--text-muted); }
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+textarea { line-height: 1.55; }
+
+.eyebrow {
+  color: var(--accent);
+  font-size: .76rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  font-weight: 800;
+}
+.text-link, .controls-link, .panel-head a, .filter-head a {
+  color: var(--accent);
+  font-weight: 750;
+}
+.empty { color: var(--text-muted); }
+.error {
+  color: var(--danger-hover);
+  background: var(--danger-soft);
+  border-radius: var(--radius-sm);
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.showcase-hero {
+  min-height: auto;
+  grid-template-columns: minmax(0, 1.05fr) minmax(340px, 560px);
+  gap: clamp(32px, 6vw, 88px);
+  padding: 96px 0 56px;
+}
+.showcase-copy { max-width: 650px; }
+.showcase-copy h1 {
+  margin: 0 0 20px;
+  max-width: 760px;
+  font-size: clamp(3.25rem, 7vw, 6rem);
+  line-height: .94;
+  font-weight: 820;
+}
+.showcase-copy p:not(.eyebrow) {
+  max-width: 560px;
+  color: var(--text-secondary);
+  font-size: 1.1rem;
+}
+.hero-actions { align-items: center; gap: 18px; margin-top: 32px; }
+.showcase-panel {
+  max-width: 640px;
+  max-height: none;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+.panel-head {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: .82rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.featured-trait { padding: 30px; overflow: visible; }
+.featured-trait h2 {
+  margin: 18px 0 12px;
+  font-size: clamp(1.65rem, 3vw, 2.35rem);
+  line-height: 1.08;
+}
+.featured-trait p { color: var(--text-secondary); margin: 0 0 18px; }
+.featured-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 24px;
+  color: var(--text-muted);
+  font-size: .82rem;
+}
+.featured-meta span {
+  border-radius: 999px;
+  background: var(--surface-3);
+  padding: 5px 9px;
+}
+.showcase-band {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  border-top: 0;
+  padding: 8px 0 28px;
+}
+.showcase-band article {
+  min-height: 188px;
+  padding: 22px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+}
+.feature-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 850;
+  margin-bottom: 18px;
+}
+.showcase-band h2 { color: var(--text-primary); font-size: 1.12rem; }
+.showcase-band p { color: var(--text-secondary); line-height: 1.55; }
+
+.browser-shell {
+  height: 100%;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0;
+}
+.browser-toolbar {
+  min-height: 86px;
+  align-items: center;
+  padding: 16px max(16px, calc((100vw - var(--content-max)) / 2 + 32px));
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg);
+}
+.browser-toolbar .eyebrow { margin-bottom: 4px; }
+.browser-toolbar h1 { font-size: clamp(1.7rem, 3vw, 2.55rem); }
+.browser-toolbar p:not(.eyebrow) { color: var(--text-secondary); margin-top: 2px; }
+.trait-browser {
+  min-height: 0;
+  grid-template-columns: minmax(240px, 280px) minmax(360px, 430px) minmax(0, 1fr);
+  gap: 0;
+}
+.library-panel, .results-panel, .reader-panel {
+  min-height: 0;
+  overflow: auto;
+  border-right: 1px solid var(--border-subtle);
+}
+.library-panel {
+  display: block;
+  padding: 20px;
+  background: var(--surface-1);
+}
+.sidebar-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.sidebar-head h2 { margin: 0; font-size: 1.15rem; line-height: 1.2; }
+.sidebar-head span, .filter-head, .list-toolbar {
+  color: var(--text-muted);
+  font-size: .82rem;
+  font-weight: 700;
+}
+.search {
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin: 0 0 20px;
+}
+.filter-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.tags {
+  gap: 8px;
+  margin: 0;
+  max-height: min(42vh, 440px);
+  overflow: auto;
+  align-content: start;
+}
+.tag {
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  padding: 7px 10px;
+  font-size: .85rem;
+  line-height: 1;
+}
+.tag:hover { border-color: var(--border-strong); background: var(--surface-3); color: var(--text-primary); }
+.tag.active {
+  border-color: rgba(54, 215, 131, .35);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.results-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: #0c0d0f;
+}
+.list-toolbar {
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.bulk-actions {
+  display: none;
+  align-items: center;
+  gap: 8px;
+}
+.has-cart .bulk-actions { display: flex; }
+.bulk-actions .button, .bulk-actions button { min-height: 36px; padding: 8px 11px; font-size: .82rem; }
+.trait-list {
+  gap: 10px;
+  padding: 16px;
+}
+.trait-list-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  cursor: pointer;
+}
+.trait-list-item:hover { background: var(--surface-2); transform: translateY(-1px); }
+.trait-list-item.active {
+  border-color: rgba(54, 215, 131, .4);
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.trait-list-item.selected {
+  border-color: rgba(54, 215, 131, .72);
+  background: rgba(54, 215, 131, .12);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.trait-link strong {
+  color: var(--text-primary);
+  font-size: 1rem;
+  line-height: 1.28;
+}
+.content-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.content-tag {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .045);
+  color: #90d9b1;
+  padding: 4px 7px;
+  font-size: .75rem;
+  line-height: 1;
+}
+.select-toggle[aria-pressed="true"] {
+  border-color: rgba(54, 215, 131, .8);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.reader-panel {
+  border-right: 0;
+  border-left: 0;
+  padding: 0;
+  background: var(--bg);
+}
+.reader-head {
+  max-width: var(--reading-max);
+  margin: 0 auto;
+  padding: 36px 32px 24px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.reader-head h1 {
+  margin: 14px 0 14px;
+  font-size: clamp(1.9rem, 3.4vw, 2.85rem);
+  line-height: 1.04;
+}
+.reader-head > div:last-child {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+}
+.back-link {
+  display: inline-flex;
+  color: var(--text-secondary);
+  font-size: .86rem;
+}
+.article-body {
+  max-width: var(--reading-max);
+  margin: 0 auto;
+  padding: 30px 32px 80px;
+}
+.article-body > h1:first-child { display: none; }
+.doc h1, .doc h2, .doc h3 { color: var(--text-primary); line-height: 1.18; }
+.doc h2 { margin: 34px 0 12px; font-size: 1.55rem; }
+.doc h3 { margin: 26px 0 10px; font-size: 1.18rem; }
+.doc p, .doc li { color: var(--text-secondary); }
+.doc p { margin: 0 0 18px; }
+.doc ul, .doc ol { padding-left: 24px; margin: 0 0 20px; }
+.doc li + li { margin-top: 8px; }
+.doc pre {
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.doc code {
+  border-radius: 5px;
+  background: var(--surface-2);
+  padding: 2px 5px;
+}
+.doc pre code { background: transparent; padding: 0; }
+.cart-bar {
+  width: min(620px, calc(100% - 32px));
+  padding: 10px 14px;
+  border-color: var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: rgba(15, 17, 19, .96);
+}
+
+.section-head {
+  align-items: center;
+  margin-bottom: 28px;
+}
+.section-head h1 {
+  margin: 0 0 8px;
+  font-size: clamp(2rem, 4vw, 3.25rem);
+  line-height: 1.05;
+}
+.section-head p { color: var(--text-secondary); }
+.admin-head, .edit-head, .admin-toolbar, .admin-filters, .admin-list, .editor {
+  max-width: 1180px;
+  margin-left: auto;
+  margin-right: auto;
+}
+.admin-toolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 520px) 1fr;
+  align-items: end;
+  gap: 18px;
+  margin-bottom: 14px;
+}
+.admin-toolbar > span {
+  justify-self: end;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.admin-filters {
+  margin-bottom: 18px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+}
+.admin-filters summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  color: var(--text-secondary);
+  font-weight: 750;
+}
+.admin-filters .tags { padding: 0 14px 14px; max-height: 128px; }
+.admin-list {
+  display: grid;
+  gap: 0;
+  overflow: visible;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+}
+.admin-row {
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: minmax(240px, 1.4fr) minmax(180px, 1fr) 130px 160px;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.admin-row:last-child { border-bottom: 0; }
+.admin-row[hidden] { display: none; }
+.admin-row-head {
+  min-height: 44px;
+  color: var(--text-muted);
+  font-size: .76rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  background: var(--surface-2);
+}
+.admin-title h2 { margin: 0 0 3px; font-size: 1rem; line-height: 1.25; }
+.admin-title span, .admin-row time { color: var(--text-muted); font-size: .82rem; }
+.actions { justify-content: flex-end; }
+.actions .button, .actions button { min-height: 38px; padding: 8px 12px; font-size: .86rem; }
+.danger-menu { position: relative; }
+.danger-menu summary {
+  list-style: none;
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.danger-menu summary::-webkit-details-marker { display: none; }
+.danger-menu summary:hover { background: var(--danger-soft); }
+.danger-menu form {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 10;
+  width: 280px;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  box-shadow: var(--shadow-card);
+}
+.danger-menu p { margin: 0 0 12px; color: var(--text-secondary); font-size: .9rem; }
+.danger-menu .danger {
+  width: 100%;
+  background: var(--danger);
+  color: #190305;
+}
+.editor {
+  max-width: 760px;
+  gap: 18px;
+  padding: 28px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+}
+.editor textarea { min-height: 540px; }
+.form-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 14px;
+  background: var(--surface-1);
+}
+
+.login-shell {
+  min-height: calc(100vh - 72px - 96px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 460px;
+  align-items: center;
+  gap: clamp(32px, 7vw, 96px);
+  max-width: 1040px;
+  margin: 0 auto;
+}
+.login-note h1 {
+  margin: 0 0 16px;
+  font-size: clamp(2.3rem, 4.6vw, 4.2rem);
+  line-height: .98;
+}
+.login-note p:not(.eyebrow) {
+  max-width: 520px;
+  color: var(--text-secondary);
+  font-size: 1.05rem;
+}
+.login {
+  width: 100%;
+  max-width: 460px;
+  margin: 0;
+  gap: 16px;
+  padding: 40px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-card);
+}
+.login-logo {
+  width: 158px;
+  height: 88px;
+  object-fit: contain;
+  margin-bottom: 4px;
+}
+.login h2 {
+  margin: 0;
+  font-size: 2rem;
+  line-height: 1.1;
+}
+.login > p { margin: 0; color: var(--text-secondary); }
+.login .button { width: 100%; margin-top: 4px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (max-width: 1199px) {
+  .trait-browser { grid-template-columns: minmax(260px, 330px) minmax(0, 1fr); }
+  .library-panel { display: none; }
+  .browser-toolbar { padding-left: 24px; padding-right: 24px; }
+  .reader-head, .article-body { padding-left: 28px; padding-right: 28px; }
+  .admin-row { grid-template-columns: minmax(220px, 1.4fr) minmax(170px, 1fr) 120px 150px; }
+}
+
+@media (max-width: 767px) {
+  body.browser-page { overflow: auto; }
+  .topbar {
+    min-height: 68px;
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .brand img { width: 142px; height: 42px; flex-basis: 142px; }
+  .topnav { display: none; }
+  .menu-toggle { display: inline-grid; }
+  main { width: min(100% - 32px, var(--content-max)); padding: 32px 0 56px; }
+  .browser-page main { height: auto; min-height: calc(100vh - 68px); }
+  .showcase-hero {
+    grid-template-columns: 1fr;
+    padding: 64px 0 36px;
+  }
+  .showcase-copy h1 { font-size: clamp(2.8rem, 14vw, 4.4rem); }
+  .showcase-band { grid-template-columns: 1fr; }
+  .showcase-band article { min-height: auto; }
+  .browser-toolbar {
+    min-height: auto;
+    align-items: flex-start;
+    padding: 16px;
+  }
+  .browser-toolbar p:not(.eyebrow) { display: none; }
+  .trait-browser {
+    display: block;
+    min-height: auto;
+  }
+  .results-panel, .reader-panel {
+    border-right: 0;
+    min-height: auto;
+    overflow: visible;
+  }
+  .results-panel { display: block; }
+  .list-toolbar { position: sticky; top: 68px; z-index: 5; background: #0c0d0f; }
+  .trait-list { padding: 12px 16px 20px; }
+  .trait-list-item { grid-template-columns: minmax(0, 1fr) auto; }
+  .detail-page .results-panel { display: none; }
+  .reader-head, .article-body {
+    max-width: 100%;
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+  .reader-head h1 { font-size: 2rem; }
+  body:not(.detail-page) .reader-panel { display: none; }
+  .bulk-actions {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    z-index: 20;
+    justify-content: center;
+    padding: 10px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: rgba(15, 17, 19, .96);
+    box-shadow: var(--shadow-card);
+  }
+  .admin-head, .section-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .admin-toolbar { grid-template-columns: 1fr; }
+  .admin-toolbar > span { justify-self: start; }
+  .admin-row-head { display: none; }
+  .admin-list {
+    gap: 10px;
+    border: 0;
+    background: transparent;
+  }
+  .admin-row {
+    grid-template-columns: 1fr;
+    min-height: 0;
+    gap: 12px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--surface-1);
+  }
+  .actions { justify-content: flex-start; flex-wrap: wrap; }
+  .danger-menu form { left: 0; right: auto; width: min(280px, calc(100vw - 48px)); }
+  .editor { padding: 20px; }
+  .form-actions { flex-direction: column-reverse; }
+  .form-actions .button, .form-actions button { width: 100%; }
+  .login-shell {
+    min-height: auto;
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+  .login-note h1 { font-size: 2.45rem; }
+  .login { padding: 28px; }
 }
 `

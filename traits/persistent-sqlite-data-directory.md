@@ -1,48 +1,55 @@
 # Persistent SQLite Data Directory
 
-#sqlite #database #persistence #docker
+#sqlite #database #persistence #data #docker
 
-This application stores its SQLite database in a dedicated persistent data directory.
+Use this trait when the app stores durable state in SQLite.
 
-Inside the container, the database should use a predictable path:
+## Database Location
+
+The SQLite database should live under the project-owned `data` directory:
 
 ```text
-/data/app.sqlite
+./data/main.sqlite
 ```
 
-The database path should be configurable through the application environment file:
+When the env file lives at `./config/.env`, configure the database with a relative path:
 
 ```env
-DATABASE_PATH=/data/app.sqlite
+DB_PATH=../data/main.sqlite
 ```
 
-Docker must mount a host directory at `/data` so the database survives container replacement, image rebuilding, and application upgrades.
+The application should resolve that path relative to the env file directory, not relative to whichever directory the process happened to start from.
 
-Example Compose configuration:
+## Startup Contract
 
-```yaml
-volumes:
-  - ./runtime/data:/data
+On startup, the application should:
+
+- create the `data` directory if it is missing
+- open or create the SQLite file
+- enable required SQLite settings for the app
+- run schema creation or migrations
+- fail clearly if the database cannot be opened or migrated
+
+## Docker Contract
+
+Docker must mount the host `./data` directory into the container:
+
+```sh
+-v $(CURDIR)/data:/app/data
 ```
 
-The application must create the database file and required schema when they do not already exist.
+The SQLite database must never be baked into the Docker image. The container is replaceable; the mounted `data` directory is the durable state.
 
-The application should fail clearly when:
+## Git And Backup Rules
 
-- the data directory does not exist and cannot be created
-- the directory is not writable
-- the configured database path points outside the intended data directory
-- schema migration fails
-- the database cannot be opened
-
-The SQLite database must not be copied into the Docker image.
-
-The database file, WAL file, and shared-memory file must be excluded from Git:
+Ignore SQLite runtime files:
 
 ```gitignore
-/runtime/data/*.sqlite
-/runtime/data/*.sqlite-wal
-/runtime/data/*.sqlite-shm
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 ```
 
-Backups must account for SQLite consistency. Prefer the SQLite backup API or a controlled application backup command rather than copying an actively written database without coordination.
+Backups should account for SQLite consistency. Prefer a controlled backup command or SQLite backup API over copying a database file while the app may be writing to it.
+
