@@ -83,7 +83,7 @@ type PageData struct {
 func main() {
 	log.SetFlags(0)
 	if len(os.Args) < 2 {
-		if err := runServe([]string{"-env", ".env"}); err != nil {
+		if err := runServe([]string{"-env", "config/.env"}); err != nil {
 			log.Fatal(err)
 		}
 		return
