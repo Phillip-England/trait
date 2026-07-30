@@ -2486,7 +2486,7 @@ body {
 
 .showcase-page .hero {
   display: grid;
-  grid-template-columns: minmax(0, .9fr) minmax(420px, 1.6fr);
+  grid-template-columns: minmax(0, 3fr) minmax(420px, 2fr);
   gap: clamp(48px, 7vw, 112px);
   align-items: center;
   min-height: calc(100svh - var(--header-height));
@@ -2508,12 +2508,12 @@ body {
 
 .showcase-copy .hero-title {
   margin: 24px 0 28px;
-  max-width: 8ch;
-  font-size: clamp(4rem, 7vw, 7.5rem);
+  max-width: 10ch;
+  font-size: clamp(4rem, 6vw, 6rem);
   line-height: .92;
   letter-spacing: -.055em;
   text-wrap: balance;
-  overflow-wrap: normal;
+  overflow-wrap: anywhere;
 }
 
 .showcase-copy p.hero-description {
