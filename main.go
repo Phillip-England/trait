@@ -909,17 +909,19 @@ const templates = `
 </head>
 <body class="{{.BodyClass}}">
   <div class="asset-loading" role="status" aria-live="polite">Loading...</div>
-  <header class="topbar">
-    <a class="brand" href="/">
-      <img src="/assets/logo-nav.png" alt="trait" width="180" height="54">
-    </a>
-    <nav class="topnav" aria-label="Primary navigation">
-      <a href="/traits">Browse traits</a>
-      {{if .IsAuthed}}<a href="/admin">Admin</a><a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
-    </nav>
-    <button class="menu-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-menu" data-menu-open>
-      <span></span><span></span><span></span>
-    </button>
+  <header class="topbar site-header">
+    <div class="site-header-inner page-container">
+      <a class="brand site-logo" href="/">
+        <img src="/assets/logo-nav.png" alt="trait" width="180" height="54">
+      </a>
+      <nav class="topnav site-nav" aria-label="Primary navigation">
+        <a href="/traits">Browse traits</a>
+        {{if .IsAuthed}}<a href="/admin">Admin</a><a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
+      </nav>
+      <button class="menu-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-menu" data-menu-open>
+        <span></span><span></span><span></span>
+      </button>
+    </div>
   </header>
   <div class="menu-overlay" data-menu-close></div>
   <nav class="side-menu" id="site-menu" aria-label="Primary navigation">
@@ -1280,25 +1282,25 @@ const templates = `
 {{end}}
 
 {{define "showcase"}}{{template "top" .}}
-  <section class="showcase-hero">
-    <div class="showcase-copy">
+  <section class="showcase-hero hero">
+    <div class="showcase-copy hero-copy">
       <p class="eyebrow">Trait library for application patterns</p>
-      <h1>Reusable patterns for better applications.</h1>
-      <p>A focused library of reusable implementation patterns for building application infrastructure, UI shells, deployment workflows, and operational guardrails.</p>
+      <h1 class="hero-title">Reusable patterns for better applications.</h1>
+      <p class="hero-description">A focused library of reusable implementation patterns for building application infrastructure, UI shells, deployment workflows, and operational guardrails.</p>
       <div class="hero-actions">
         <a class="button" href="/traits">Browse traits</a>
         {{if .Trait.Slug}}<a class="text-link" href="/traits/{{.Trait.Slug}}">View featured trait</a>{{end}}
       </div>
     </div>
-    <div class="showcase-panel" aria-label="Featured trait preview">
-      <div class="panel-head">
+    <div class="showcase-panel featured-trait-card" aria-label="Featured trait preview">
+      <div class="panel-head featured-trait-header">
         <span>Featured trait</span>
         {{if .Trait.Slug}}<a href="/traits/{{.Trait.Slug}}">Read trait</a>{{end}}
       </div>
-      <div class="featured-trait">
+      <div class="featured-trait featured-trait-body">
         {{if .Trait.Slug}}
           {{template "contentTags" .Trait.Tags}}
-          <h2>{{.Trait.Title}}</h2>
+          <h2 class="featured-trait-title">{{.Trait.Title}}</h2>
           <p>Reusable guidance stored as markdown, ready to read, select, and copy into an implementation brief.</p>
           <div class="featured-meta"><span>Markdown source</span><span>{{len .Trait.Tags}} tags</span></div>
           <a class="button secondary" href="/traits/{{.Trait.Slug}}">Open trait</a>
@@ -2432,5 +2434,244 @@ textarea { line-height: 1.55; }
   }
   .login-note h1 { font-size: 2.45rem; }
   .login { padding: 28px; }
+}
+
+/* Responsive landing-page layout */
+:root {
+  --page-max-width: 1440px;
+  --header-height: 104px;
+  --page-gutter: clamp(24px, 4vw, 48px);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  overflow-x: clip;
+}
+
+.page-container {
+  width: min(calc(100% - (var(--page-gutter) * 2)), var(--page-max-width));
+  margin-inline: auto;
+}
+
+.site-header {
+  min-height: var(--header-height);
+  padding: 0;
+}
+
+.site-header-inner {
+  min-height: var(--header-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+}
+
+.site-logo,
+.site-nav {
+  min-width: 0;
+}
+
+.showcase-page main {
+  width: min(calc(100% - (var(--page-gutter) * 2)), var(--page-max-width));
+  max-width: 100%;
+  margin-inline: auto;
+  padding: 0 0 72px;
+}
+
+.showcase-page .hero {
+  display: grid;
+  grid-template-columns: minmax(0, .9fr) minmax(420px, 1.6fr);
+  gap: clamp(48px, 7vw, 112px);
+  align-items: center;
+  min-height: calc(100svh - var(--header-height));
+  padding-block: clamp(64px, 9vw, 132px);
+  margin: 0;
+  border: 0;
+}
+
+.hero-copy,
+.featured-trait-card,
+.featured-trait-body {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.showcase-copy.hero-copy {
+  max-width: none;
+}
+
+.showcase-copy .hero-title {
+  margin: 24px 0 28px;
+  max-width: 8ch;
+  font-size: clamp(4rem, 7vw, 7.5rem);
+  line-height: .92;
+  letter-spacing: -.055em;
+  text-wrap: balance;
+  overflow-wrap: normal;
+}
+
+.showcase-copy p.hero-description {
+  max-width: 34rem;
+  margin: 0 0 40px;
+  color: var(--text-secondary);
+  font-size: clamp(1.1rem, 1.5vw, 1.45rem);
+  line-height: 1.65;
+}
+
+.hero-actions {
+  margin-top: 0;
+}
+
+.showcase-panel.featured-trait-card {
+  width: 100%;
+  max-width: 860px;
+  max-height: none;
+  justify-self: end;
+  border-color: rgba(255, 255, 255, .07);
+  border-radius: 24px;
+  background: linear-gradient(145deg, rgba(24, 28, 31, .92), rgba(15, 17, 19, .98));
+  overflow: hidden;
+}
+
+.featured-trait-header {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.featured-trait.featured-trait-body {
+  padding: clamp(28px, 4vw, 52px);
+  overflow: visible;
+}
+
+.featured-trait .featured-trait-title {
+  font-size: clamp(2rem, 3vw, 3rem);
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.featured-trait-body .content-tags,
+.featured-trait-body .featured-meta {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 1150px) and (min-width: 1101px) {
+  .showcase-copy .hero-title {
+    font-size: clamp(3.75rem, 8vw, 6rem);
+    max-width: 10ch;
+  }
+}
+
+@media (max-width: 1100px) {
+  .showcase-page .hero {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 56px;
+    align-items: start;
+    min-height: auto;
+    padding-block: 64px 96px;
+  }
+
+  .showcase-copy.hero-copy {
+    max-width: 760px;
+  }
+
+  .showcase-copy .hero-title {
+    max-width: 10ch;
+    font-size: clamp(3.75rem, 8vw, 6rem);
+  }
+
+  .showcase-panel.featured-trait-card {
+    width: 100%;
+    max-width: none;
+    justify-self: stretch;
+  }
+}
+
+@media (max-width: 700px) {
+  :root {
+    --header-height: 80px;
+    --page-gutter: 16px;
+  }
+
+  .site-header,
+  .site-header-inner {
+    min-height: var(--header-height);
+  }
+
+  .site-header-inner {
+    gap: 20px;
+  }
+
+  .site-logo {
+    max-width: 160px;
+  }
+
+  .site-logo img {
+    max-width: 100%;
+  }
+
+  .showcase-page .hero {
+    gap: 40px;
+    padding-block: 48px 72px;
+  }
+
+  .showcase-copy .hero-title {
+    max-width: 100%;
+    font-size: clamp(3rem, 15vw, 4.75rem);
+    line-height: .96;
+  }
+
+  .showcase-copy p.hero-description {
+    font-size: 1.05rem;
+    line-height: 1.6;
+  }
+
+  .featured-trait.featured-trait-body {
+    padding: 28px 22px;
+  }
+}
+
+@media (max-width: 480px) {
+  .site-logo {
+    max-width: 142px;
+  }
+
+  .site-nav {
+    display: none;
+  }
+
+  .menu-toggle {
+    display: inline-grid;
+    flex: 0 0 auto;
+  }
+
+  .hero-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .hero-actions .button,
+  .hero-actions .text-link,
+  .featured-trait-body > .button {
+    width: 100%;
+    text-align: center;
+    justify-content: center;
+  }
+
+  .featured-trait-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
 }
 `
