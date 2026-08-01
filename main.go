@@ -29,10 +29,12 @@ import (
 )
 
 const (
-	sessionCookie = "trait_session"
-	failWindow    = 24 * time.Hour
-	maxFailures   = 5
-	sessionTTL    = 12 * time.Hour
+	sessionCookie  = "trait_session"
+	failWindow     = 24 * time.Hour
+	maxFailures    = 5
+	sessionTTL     = 12 * time.Hour
+	defaultEnvPath = "config/.env"
+	defaultDBPath  = "data/main.sqlite"
 )
 
 type Config struct {
@@ -83,7 +85,7 @@ type PageData struct {
 func main() {
 	log.SetFlags(0)
 	if len(os.Args) < 2 {
-		if err := runServe([]string{"-env", "config/.env"}); err != nil {
+		if err := runServe(nil); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -107,13 +109,13 @@ func main() {
 func usage() {
 	fmt.Println("usage:")
 	fmt.Println("  trait")
-	fmt.Println("  trait init -env /path/to/.env")
-	fmt.Println("  trait serve -env /path/to/.env")
+	fmt.Println("  trait init")
+	fmt.Println("  trait serve")
 }
 
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	envPath := fs.String("env", "config/.env", "path to write the env file")
+	envPath := fs.String("env", defaultEnvPath, "path to write the env file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -126,7 +128,7 @@ func runInit(args []string) error {
 	if err := os.MkdirAll(envDir, 0o755); err != nil {
 		return err
 	}
-	dbPath := resolveRelative(envDir, "../data/main.sqlite")
+	dbPath := resolveRelative(filepath.Dir(envDir), defaultDBPath)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return err
 	}
@@ -139,7 +141,6 @@ func runInit(args []string) error {
 	content := fmt.Sprintf(`ADMIN_USERNAME=admin
 ADMIN_PASSWORD=change-me-now
 SESSION_SECRET=%s
-DB_PATH=../data/main.sqlite
 TRAITS_DIR=../traits
 ADDR=:6688
 ACCENT_COLOR=#35d07f
@@ -164,12 +165,9 @@ ACCENT_COLOR=#35d07f
 
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	envPath := fs.String("env", "", "required path to env file")
+	envPath := fs.String("env", defaultEnvPath, "path to env file")
 	if err := fs.Parse(args); err != nil {
 		return err
-	}
-	if *envPath == "" {
-		return errors.New("serve requires -env /path/to/.env")
 	}
 
 	cfg, err := loadConfig(*envPath)
@@ -230,7 +228,7 @@ func loadConfig(envPath string) (Config, error) {
 		AdminUsername: values["ADMIN_USERNAME"],
 		AdminPassword: values["ADMIN_PASSWORD"],
 		SessionSecret: values["SESSION_SECRET"],
-		DBPath:        values["DB_PATH"],
+		DBPath:        filepath.Join(filepath.Dir(base), defaultDBPath),
 		TraitsDir:     values["TRAITS_DIR"],
 		Addr:          values["ADDR"],
 		AccentColor:   values["ACCENT_COLOR"],
@@ -249,7 +247,6 @@ func loadConfig(envPath string) (Config, error) {
 		"ADMIN_USERNAME": cfg.AdminUsername,
 		"ADMIN_PASSWORD": cfg.AdminPassword,
 		"SESSION_SECRET": cfg.SessionSecret,
-		"DB_PATH":        cfg.DBPath,
 		"TRAITS_DIR":     cfg.TraitsDir,
 	}
 	for key, value := range required {
@@ -257,7 +254,6 @@ func loadConfig(envPath string) (Config, error) {
 			return Config{}, fmt.Errorf("%s is required in %s", key, envPath)
 		}
 	}
-	cfg.DBPath = resolveRelative(base, cfg.DBPath)
 	cfg.TraitsDir = resolveRelative(base, cfg.TraitsDir)
 	cfg.LogoPath = resolveAssetPath(base, "logo.png")
 	return cfg, nil
