@@ -1,0 +1,28 @@
+{
+  "variables": [
+    {
+      "name": "ADMIN_USERNAME",
+      "description": "Username for the built-in administrator account used to access the admin interface.",
+      "example": "admin",
+      "required": true
+    },
+    {
+      "name": "ADMIN_PASSWORD",
+      "description": "Password for the built-in administrator account. Choose a strong unique password before exposing the app.",
+      "example": "change-this-password",
+      "required": true
+    },
+    {
+      "name": "SESSION_SECRET",
+      "description": "Random secret used to sign admin session cookies. Generate a long unpredictable value.",
+      "example": "base64-or-hex-random-secret",
+      "required": true
+    },
+    {
+      "name": "TRAITS_DIR",
+      "description": "Directory containing trait markdown files. Relative paths are resolved from config/.env.",
+      "example": "../traits",
+      "required": true
+    }
+  ]
+}
