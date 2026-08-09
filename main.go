@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -54,6 +55,7 @@ type App struct {
 	db       *sql.DB
 	sessions *SessionStore
 	md       goldmark.Markdown
+	importMu sync.Mutex
 }
 
 type SessionStore struct {
@@ -62,12 +64,21 @@ type SessionStore struct {
 }
 
 type Trait struct {
-	Slug    string
-	Title   string
-	Content string
-	HTML    template.HTML
-	Tags    []string
-	ModTime time.Time
+	Slug          string
+	Title         string
+	Content       string
+	HTML          template.HTML
+	Tags          []string
+	ModTime       time.Time
+	WorkspaceSlug string
+	WorkspaceName string
+}
+
+type Workspace struct {
+	Slug        string
+	Name        string
+	Description string
+	TraitCount  int
 }
 
 type PageData struct {
@@ -78,6 +89,9 @@ type PageData struct {
 	ActiveTag  string
 	Search     string
 	Error      string
+	Notice     string
+	Workspace  Workspace
+	Workspaces []Workspace
 	IsAuthed   bool
 	AdminRoute bool
 	BodyClass  string
@@ -240,10 +254,14 @@ func runServe(args []string) error {
 	mux.HandleFunc("/", app.showcase)
 	mux.HandleFunc("/traits", app.publicTraits)
 	mux.HandleFunc("/traits/", app.publicTrait)
+	mux.HandleFunc("/workspaces/", app.publicWorkspace)
 	mux.HandleFunc("/login", app.login)
 	mux.HandleFunc("/logout", app.logout)
 	mux.HandleFunc("/admin", app.requireAuth(app.adminIndex))
 	mux.HandleFunc("/admin/new", app.requireAuth(app.adminNew))
+	mux.HandleFunc("/admin/import", app.requireAuth(app.adminImport))
+	mux.HandleFunc("/admin/workspaces/new", app.requireAuth(app.adminWorkspaceNew))
+	mux.HandleFunc("/admin/workspaces/", app.requireAuth(app.adminWorkspace))
 	mux.HandleFunc("/admin/edit/", app.requireAuth(app.adminEdit))
 	mux.HandleFunc("/admin/delete/", app.requireAuth(app.adminDelete))
 	mux.HandleFunc("/assets/logo.png", app.logo)
@@ -328,6 +346,12 @@ CREATE TABLE IF NOT EXISTS login_failures (
 );
 CREATE INDEX IF NOT EXISTS idx_login_failures_ip_time
 ON login_failures (ip, attempted_at);
+CREATE TABLE IF NOT EXISTS workspaces (
+  slug TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
 `)
 	return err
 }
@@ -367,7 +391,11 @@ func (a *App) publicTraits(w http.ResponseWriter, r *http.Request) {
 	if len(traits) > 0 {
 		selected = traits[0]
 	}
-	render(w, "public", PageData{Config: a.cfg, Traits: traits, Trait: selected, Tags: tags, ActiveTag: active, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page"})
+	workspaces, _ := a.loadWorkspaces()
+	if search != "" {
+		workspaces = searchWorkspaces(workspaces, search)
+	}
+	render(w, "public", PageData{Config: a.cfg, Traits: traits, Trait: selected, Tags: tags, Workspaces: workspaces, ActiveTag: active, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page"})
 }
 
 func (a *App) publicTrait(w http.ResponseWriter, r *http.Request) {
@@ -393,6 +421,51 @@ func (a *App) publicTrait(w http.ResponseWriter, r *http.Request) {
 	render(w, "trait", PageData{Config: a.cfg, Traits: traits, Trait: trait, Tags: tags, ActiveTag: active, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page detail-page"})
 }
 
+func (a *App) publicWorkspace(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/workspaces/"), "/"), "/")
+	if len(parts) == 0 || !validSlug(parts[0]) {
+		http.NotFound(w, r)
+		return
+	}
+	workspace, err := a.loadWorkspace(parts[0])
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 3 && parts[1] == "traits" {
+		trait, err := a.loadWorkspaceTrait(workspace, parts[2])
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		traits, tags, err := a.loadWorkspaceTraits(workspace)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		render(w, "trait", PageData{Config: a.cfg, Workspace: workspace, Traits: traits, Trait: trait, Tags: tags, Search: strings.TrimSpace(r.URL.Query().Get("q")), IsAuthed: a.isAuthed(r), BodyClass: "browser-page detail-page"})
+		return
+	}
+	if len(parts) != 1 {
+		http.NotFound(w, r)
+		return
+	}
+	traits, tags, err := a.loadWorkspaceTraits(workspace)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	if search != "" {
+		traits = searchTraits(traits, search)
+	}
+	var selected Trait
+	if len(traits) > 0 {
+		selected = traits[0]
+	}
+	render(w, "public", PageData{Config: a.cfg, Workspace: workspace, Traits: traits, Trait: selected, Tags: tags, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page"})
+}
+
 func (a *App) controls(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/controls" {
 		http.NotFound(w, r)
@@ -407,12 +480,178 @@ func (a *App) adminIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	render(w, "admin", PageData{Config: a.cfg, Traits: traits, Tags: tags, IsAuthed: true, AdminRoute: true})
+	workspaces, err := a.loadWorkspaces()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	render(w, "admin", PageData{Config: a.cfg, Traits: traits, Tags: tags, Workspaces: workspaces, Notice: strings.TrimSpace(r.URL.Query().Get("notice")), IsAuthed: true, AdminRoute: true})
+}
+
+const (
+	maxImportBytes = 64 << 20
+	maxTraitBytes  = 2 << 20
+)
+
+type uploadedTrait struct {
+	title   string
+	content []byte
+}
+
+func (a *App) adminWorkspaceNew(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		render(w, "workspaceEdit", PageData{Config: a.cfg, IsAuthed: true, AdminRoute: true})
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	description := strings.TrimSpace(r.FormValue("description"))
+	if name == "" {
+		render(w, "workspaceEdit", PageData{Config: a.cfg, Workspace: Workspace{Name: name, Description: description}, Error: "A workspace name is required.", IsAuthed: true, AdminRoute: true})
+		return
+	}
+	base := slugify(name)
+	slug := base
+	for i := 2; ; i++ {
+		_, err := a.db.Exec(`INSERT INTO workspaces (slug, name, description, created_at) VALUES (?, ?, ?, ?)`, slug, name, description, time.Now().Unix())
+		if err == nil {
+			break
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "unique") {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		slug = fmt.Sprintf("%s-%d", base, i)
+	}
+	if err := os.MkdirAll(a.workspaceDir(slug), 0o755); err != nil {
+		_, _ = a.db.Exec(`DELETE FROM workspaces WHERE slug = ?`, slug)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin/workspaces/"+slug, http.StatusSeeOther)
+}
+
+func (a *App) adminWorkspace(w http.ResponseWriter, r *http.Request) {
+	slug := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/workspaces/"), "/")
+	workspace, err := a.loadWorkspace(slug)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	traits, tags, err := a.loadWorkspaceTraits(workspace)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	render(w, "admin", PageData{Config: a.cfg, Workspace: workspace, Traits: traits, Tags: tags, Notice: strings.TrimSpace(r.URL.Query().Get("notice")), IsAuthed: true, AdminRoute: true})
+}
+
+// adminImport accepts both an individual Markdown file and the collection of
+// files produced by a browser directory picker. Directory structure is
+// intentionally flattened because traits are stored as a flat slug library.
+func (a *App) adminImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxImportBytes)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		http.Error(w, "Upload must be a Markdown file or a directory of Markdown files (64 MB maximum).", http.StatusBadRequest)
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+	destination := a.cfg.TraitsDir
+	workspaceSlug := strings.TrimSpace(r.FormValue("workspace"))
+	if workspaceSlug != "" {
+		workspace, err := a.loadWorkspace(workspaceSlug)
+		if err != nil {
+			http.Error(w, "Workspace not found.", http.StatusBadRequest)
+			return
+		}
+		destination = a.workspaceDir(workspace.Slug)
+	}
+
+	var pending []uploadedTrait
+	skipped := 0
+	for _, headers := range r.MultipartForm.File {
+		for _, header := range headers {
+			if !strings.EqualFold(filepath.Ext(header.Filename), ".md") {
+				skipped++
+				continue
+			}
+			file, err := header.Open()
+			if err != nil {
+				http.Error(w, "Could not read "+filepath.Base(header.Filename)+".", http.StatusBadRequest)
+				return
+			}
+			content, err := io.ReadAll(io.LimitReader(file, maxTraitBytes+1))
+			file.Close()
+			if err != nil || len(content) > maxTraitBytes {
+				http.Error(w, filepath.Base(header.Filename)+" is unreadable or larger than 2 MB.", http.StatusBadRequest)
+				return
+			}
+			content = bytes.TrimSpace(content)
+			if len(content) == 0 {
+				skipped++
+				continue
+			}
+			title := titleFromMarkdown(string(content))
+			if title == "" {
+				title = strings.TrimSuffix(filepath.Base(header.Filename), filepath.Ext(header.Filename))
+				content = append([]byte("# "+title+"\n\n"), content...)
+			}
+			pending = append(pending, uploadedTrait{title: title, content: content})
+		}
+	}
+	if len(pending) == 0 {
+		http.Error(w, "No non-empty Markdown files were found in that upload.", http.StatusBadRequest)
+		return
+	}
+
+	// Keep slug selection and writes together so simultaneous uploads cannot
+	// select the same collision suffix.
+	a.importMu.Lock()
+	defer a.importMu.Unlock()
+	written := make([]string, 0, len(pending))
+	for _, trait := range pending {
+		path, err := writeUniqueTrait(destination, slugify(trait.title), append(trait.content, '\n'))
+		if err != nil {
+			for _, created := range written {
+				_ = os.Remove(created)
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		written = append(written, path)
+	}
+	notice := fmt.Sprintf("Imported %d trait", len(written))
+	if len(written) != 1 {
+		notice += "s"
+	}
+	if skipped > 0 {
+		notice += fmt.Sprintf("; skipped %d non-Markdown or empty file", skipped)
+		if skipped != 1 {
+			notice += "s"
+		}
+	}
+	notice += ". Name collisions were resolved automatically."
+	redirect := "/admin"
+	if workspaceSlug != "" {
+		redirect = "/admin/workspaces/" + workspaceSlug
+	}
+	http.Redirect(w, r, redirect+"?notice="+url.QueryEscape(notice), http.StatusSeeOther)
 }
 
 func (a *App) adminNew(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		render(w, "edit", PageData{Config: a.cfg, Trait: Trait{}, IsAuthed: true, AdminRoute: true})
+		var workspace Workspace
+		if slug := strings.TrimSpace(r.URL.Query().Get("workspace")); slug != "" {
+			workspace, _ = a.loadWorkspace(slug)
+		}
+		render(w, "edit", PageData{Config: a.cfg, Workspace: workspace, Trait: Trait{}, IsAuthed: true, AdminRoute: true})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -421,16 +660,32 @@ func (a *App) adminNew(w http.ResponseWriter, r *http.Request) {
 	}
 	title := strings.TrimSpace(r.FormValue("title"))
 	content := strings.TrimSpace(r.FormValue("content"))
+	workspaceSlug := strings.TrimSpace(r.FormValue("workspace"))
+	var workspace Workspace
+	if workspaceSlug != "" {
+		workspace, _ = a.loadWorkspace(workspaceSlug)
+	}
 	if title == "" || content == "" {
-		render(w, "edit", PageData{Config: a.cfg, Trait: Trait{Title: title, Content: content}, Error: "Title and markdown are required.", IsAuthed: true, AdminRoute: true})
+		render(w, "edit", PageData{Config: a.cfg, Workspace: workspace, Trait: Trait{Title: title, Content: content}, Error: "Title and markdown are required.", IsAuthed: true, AdminRoute: true})
 		return
 	}
-	slug := uniqueSlug(a.cfg.TraitsDir, slugify(title))
 	if !strings.HasPrefix(content, "# ") {
 		content = "# " + title + "\n\n" + content
 	}
-	if err := os.WriteFile(filepath.Join(a.cfg.TraitsDir, slug+".md"), []byte(content+"\n"), 0o644); err != nil {
+	destination := a.cfg.TraitsDir
+	if workspaceSlug != "" {
+		if _, err := a.loadWorkspace(workspaceSlug); err != nil {
+			http.Error(w, "Workspace not found.", http.StatusBadRequest)
+			return
+		}
+		destination = a.workspaceDir(workspaceSlug)
+	}
+	if _, err := writeUniqueTrait(destination, slugify(title), []byte(content+"\n")); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if workspaceSlug != "" {
+		http.Redirect(w, r, "/admin/workspaces/"+workspaceSlug, http.StatusSeeOther)
 		return
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
@@ -442,13 +697,26 @@ func (a *App) adminEdit(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	trait, err := a.loadTrait(slug)
+	workspaceSlug := strings.TrimSpace(r.URL.Query().Get("workspace"))
+	directory := a.cfg.TraitsDir
+	var workspace Workspace
+	var trait Trait
+	var err error
+	if workspaceSlug != "" {
+		workspace, err = a.loadWorkspace(workspaceSlug)
+		if err == nil {
+			trait, err = a.loadWorkspaceTrait(workspace, slug)
+			directory = a.workspaceDir(workspaceSlug)
+		}
+	} else {
+		trait, err = a.loadTrait(slug)
+	}
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	if r.Method == http.MethodGet {
-		render(w, "edit", PageData{Config: a.cfg, Trait: trait, IsAuthed: true, AdminRoute: true})
+		render(w, "edit", PageData{Config: a.cfg, Workspace: workspace, Trait: trait, IsAuthed: true, AdminRoute: true})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -458,11 +726,15 @@ func (a *App) adminEdit(w http.ResponseWriter, r *http.Request) {
 	content := strings.TrimSpace(r.FormValue("content"))
 	if content == "" {
 		trait.Content = content
-		render(w, "edit", PageData{Config: a.cfg, Trait: trait, Error: "Markdown is required.", IsAuthed: true, AdminRoute: true})
+		render(w, "edit", PageData{Config: a.cfg, Workspace: workspace, Trait: trait, Error: "Markdown is required.", IsAuthed: true, AdminRoute: true})
 		return
 	}
-	if err := os.WriteFile(filepath.Join(a.cfg.TraitsDir, slug+".md"), []byte(content+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(directory, slug+".md"), []byte(content+"\n"), 0o644); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if workspaceSlug != "" {
+		http.Redirect(w, r, "/admin/workspaces/"+workspaceSlug, http.StatusSeeOther)
 		return
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
@@ -478,8 +750,21 @@ func (a *App) adminDelete(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err := os.Remove(filepath.Join(a.cfg.TraitsDir, slug+".md")); err != nil && !errors.Is(err, os.ErrNotExist) {
+	directory := a.cfg.TraitsDir
+	workspaceSlug := strings.TrimSpace(r.URL.Query().Get("workspace"))
+	if workspaceSlug != "" {
+		if _, err := a.loadWorkspace(workspaceSlug); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		directory = a.workspaceDir(workspaceSlug)
+	}
+	if err := os.Remove(filepath.Join(directory, slug+".md")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if workspaceSlug != "" {
+		http.Redirect(w, r, "/admin/workspaces/"+workspaceSlug, http.StatusSeeOther)
 		return
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
@@ -642,22 +927,30 @@ func (a *App) failureCount(ip string) (int, error) {
 
 func (a *App) loadTraits() ([]Trait, []string, error) {
 	var traits []Trait
-	err := filepath.WalkDir(a.cfg.TraitsDir, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() || filepath.Ext(path) != ".md" {
-			return nil
-		}
-		trait, err := a.readTrait(path)
-		if err != nil {
-			return err
-		}
-		traits = append(traits, trait)
-		return nil
-	})
+	entries, err := os.ReadDir(a.cfg.TraitsDir)
 	if err != nil {
 		return nil, nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
+			continue
+		}
+		trait, err := a.readTrait(filepath.Join(a.cfg.TraitsDir, entry.Name()))
+		if err != nil {
+			return nil, nil, err
+		}
+		traits = append(traits, trait)
+	}
+	workspaces, err := a.loadWorkspaces()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, workspace := range workspaces {
+		workspaceTraits, _, err := a.loadWorkspaceTraits(workspace)
+		if err != nil {
+			return nil, nil, err
+		}
+		traits = append(traits, workspaceTraits...)
 	}
 	sort.Slice(traits, func(i, j int) bool {
 		return strings.ToLower(traits[i].Title) < strings.ToLower(traits[j].Title)
@@ -674,6 +967,80 @@ func (a *App) loadTraits() ([]Trait, []string, error) {
 	}
 	sort.Strings(tags)
 	return traits, tags, nil
+}
+
+func (a *App) workspaceDir(slug string) string {
+	return filepath.Join(a.cfg.TraitsDir, "workspaces", slug)
+}
+
+func (a *App) loadWorkspaces() ([]Workspace, error) {
+	rows, err := a.db.Query(`SELECT slug, name, description FROM workspaces ORDER BY lower(name)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var workspaces []Workspace
+	for rows.Next() {
+		var workspace Workspace
+		if err := rows.Scan(&workspace.Slug, &workspace.Name, &workspace.Description); err != nil {
+			return nil, err
+		}
+		entries, _ := os.ReadDir(a.workspaceDir(workspace.Slug))
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
+				workspace.TraitCount++
+			}
+		}
+		workspaces = append(workspaces, workspace)
+	}
+	return workspaces, rows.Err()
+}
+
+func (a *App) loadWorkspace(slug string) (Workspace, error) {
+	var workspace Workspace
+	err := a.db.QueryRow(`SELECT slug, name, description FROM workspaces WHERE slug = ?`, slug).Scan(&workspace.Slug, &workspace.Name, &workspace.Description)
+	return workspace, err
+}
+
+func (a *App) loadWorkspaceTraits(workspace Workspace) ([]Trait, []string, error) {
+	entries, err := os.ReadDir(a.workspaceDir(workspace.Slug))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var traits []Trait
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
+			continue
+		}
+		trait, err := a.readTraitIn(filepath.Join(a.workspaceDir(workspace.Slug), entry.Name()), workspace)
+		if err != nil {
+			return nil, nil, err
+		}
+		traits = append(traits, trait)
+	}
+	sort.Slice(traits, func(i, j int) bool { return strings.ToLower(traits[i].Title) < strings.ToLower(traits[j].Title) })
+	tagSet := map[string]bool{}
+	for _, trait := range traits {
+		for _, tag := range trait.Tags {
+			tagSet[tag] = true
+		}
+	}
+	var tags []string
+	for tag := range tagSet {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return traits, tags, nil
+}
+
+func (a *App) loadWorkspaceTrait(workspace Workspace, slug string) (Trait, error) {
+	if !validSlug(slug) {
+		return Trait{}, os.ErrNotExist
+	}
+	return a.readTraitIn(filepath.Join(a.workspaceDir(workspace.Slug), slug+".md"), workspace)
 }
 
 func seedTraitsDir(target string) error {
@@ -742,6 +1109,10 @@ func (a *App) loadTrait(slug string) (Trait, error) {
 }
 
 func (a *App) readTrait(path string) (Trait, error) {
+	return a.readTraitIn(path, Workspace{})
+}
+
+func (a *App) readTraitIn(path string, workspace Workspace) (Trait, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return Trait{}, err
@@ -760,12 +1131,14 @@ func (a *App) readTrait(path string) (Trait, error) {
 		return Trait{}, err
 	}
 	return Trait{
-		Slug:    strings.TrimSuffix(filepath.Base(path), ".md"),
-		Title:   title,
-		Content: content,
-		HTML:    template.HTML(buf.String()),
-		Tags:    tagsFromMarkdown(content),
-		ModTime: info.ModTime(),
+		Slug:          strings.TrimSuffix(filepath.Base(path), ".md"),
+		Title:         title,
+		Content:       content,
+		HTML:          template.HTML(buf.String()),
+		Tags:          tagsFromMarkdown(content),
+		ModTime:       info.ModTime(),
+		WorkspaceSlug: workspace.Slug,
+		WorkspaceName: workspace.Name,
 	}, nil
 }
 
@@ -823,6 +1196,17 @@ func searchTraits(traits []Trait, query string) []Trait {
 	return out
 }
 
+func searchWorkspaces(workspaces []Workspace, query string) []Workspace {
+	query = strings.ToLower(strings.TrimSpace(query))
+	var out []Workspace
+	for _, workspace := range workspaces {
+		if strings.Contains(strings.ToLower(workspace.Name+" "+workspace.Description), query) {
+			out = append(out, workspace)
+		}
+	}
+	return out
+}
+
 func featuredTrait(traits []Trait) Trait {
 	for _, trait := range traits {
 		if trait.Slug == "application-control-system" {
@@ -859,6 +1243,12 @@ func render(w http.ResponseWriter, name string, data PageData) {
 				return "/traits/" + slug + "?" + encoded
 			}
 			return "/traits/" + slug
+		},
+		"traitPath": func(trait Trait) string {
+			if trait.WorkspaceSlug != "" {
+				return "/workspaces/" + trait.WorkspaceSlug + "/traits/" + trait.Slug
+			}
+			return "/traits/" + trait.Slug
 		},
 		"libraryURL": func(tag, search string) string {
 			values := url.Values{}
@@ -979,13 +1369,30 @@ func validSlug(value string) bool {
 	return value != "" && value == slugify(value)
 }
 
-func uniqueSlug(dir, base string) string {
-	slug := base
-	for i := 2; ; i++ {
-		if _, err := os.Stat(filepath.Join(dir, slug+".md")); errors.Is(err, os.ErrNotExist) {
-			return slug
+func writeUniqueTrait(dir, base string, content []byte) (string, error) {
+	for i := 1; ; i++ {
+		slug := base
+		if i > 1 {
+			slug = fmt.Sprintf("%s-%d", base, i)
 		}
-		slug = fmt.Sprintf("%s-%d", base, i)
+		path := filepath.Join(dir, slug+".md")
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if _, err := file.Write(content); err != nil {
+			_ = file.Close()
+			_ = os.Remove(path)
+			return "", err
+		}
+		if err := file.Close(); err != nil {
+			_ = os.Remove(path)
+			return "", err
+		}
+		return path, nil
 	}
 }
 
@@ -1479,13 +1886,13 @@ const templates = `
       <p class="hero-description">A focused library of reusable implementation patterns for building application infrastructure, UI shells, deployment workflows, and operational guardrails.</p>
       <div class="hero-actions">
         <a class="button" href="/traits">Browse traits</a>
-        {{if .Trait.Slug}}<a class="text-link" href="/traits/{{.Trait.Slug}}">View featured trait</a>{{end}}
+        {{if .Trait.Slug}}<a class="text-link" href="{{traitPath .Trait}}">View featured trait</a>{{end}}
       </div>
     </div>
     <div class="showcase-panel featured-trait-card" aria-label="Featured trait preview">
       <div class="panel-head featured-trait-header">
         <span>Featured trait</span>
-        {{if .Trait.Slug}}<a href="/traits/{{.Trait.Slug}}">Read trait</a>{{end}}
+        {{if .Trait.Slug}}<a href="{{traitPath .Trait}}">Read trait</a>{{end}}
       </div>
       <div class="featured-trait featured-trait-body">
         {{if .Trait.Slug}}
@@ -1493,7 +1900,7 @@ const templates = `
           <h2 class="featured-trait-title">{{.Trait.Title}}</h2>
           <p>Reusable guidance stored as markdown, ready to read, select, and copy into an implementation brief.</p>
           <div class="featured-meta"><span>Markdown source</span><span>{{len .Trait.Tags}} tags</span></div>
-          <a class="button secondary" href="/traits/{{.Trait.Slug}}">Open trait</a>
+          <a class="button secondary" href="{{traitPath .Trait}}">Open trait</a>
         {{else}}
           <p class="empty">No traits have been published yet.</p>
         {{end}}
@@ -1535,11 +1942,16 @@ const templates = `
         <h2>Library</h2>
         <span>{{len .Traits}} results</span>
       </div>
-      <form class="search" method="get" action="/traits">
+      <form class="search" method="get" action="{{if .Workspace}}/workspaces/{{.Workspace.Slug}}{{else}}/traits{{end}}">
         {{if .ActiveTag}}<input type="hidden" name="tag" value="{{.ActiveTag}}">{{end}}
         <label>Search traits<input data-trait-search name="q" value="{{.Search}}" type="search" placeholder="Search title, tag, or markdown" autocomplete="off"></label>
         <button class="button secondary" type="submit">Search</button>
       </form>
+      {{if .Workspace}}
+        <div class="workspace-context"><strong>{{.Workspace.Name}}</strong><p>{{.Workspace.Description}}</p><a href="/traits">Search all workspaces</a></div>
+      {{else if .Workspaces}}
+        <div class="workspace-links"><span>Workspaces</span>{{range .Workspaces}}<a href="/workspaces/{{.Slug}}"><strong>{{.Name}}</strong><small>{{.TraitCount}} traits</small></a>{{end}}</div>
+      {{end}}
       <div class="filter-head"><span>Tags</span>{{if or .ActiveTag .Search}}<a href="/traits">Reset</a>{{end}}</div>
       {{template "tags" .}}
     </aside>
@@ -1555,7 +1967,7 @@ const templates = `
       <div class="trait-list">
         {{range .Traits}}
           <article class="trait-list-item {{if eq $.Trait.Slug .Slug}}active{{end}}" data-trait data-search data-slug="{{.Slug}}" data-title="{{.Title}}" data-content="{{.Content}}" data-search-text="{{.Title}} {{joinTags .Tags}} {{.Content}}">
-            <a class="trait-link" href="{{traitURL .Slug $.ActiveTag $.Search}}">
+            <a class="trait-link" href="{{traitPath .}}">
               <strong>{{.Title}}</strong>
               {{template "contentTags" .Tags}}
             </a>
@@ -1571,7 +1983,7 @@ const templates = `
     <article class="doc reader-panel" data-trait data-slug="{{.Trait.Slug}}" data-title="{{.Trait.Title}}" data-content="{{.Trait.Content}}">
       {{if .Trait.Slug}}
         <header class="reader-head">
-          <a class="back-link" href="{{libraryURL .ActiveTag .Search}}">Back to library</a>
+          <a class="back-link" href="{{if .Workspace}}/workspaces/{{.Workspace.Slug}}{{else}}{{libraryURL .ActiveTag .Search}}{{end}}">Back to library</a>
           <h1>{{.Trait.Title}}</h1>
           {{template "contentTags" .Trait.Tags}}
           <div>
@@ -1670,11 +2082,36 @@ const templates = `
 {{define "admin"}}{{template "top" .}}
   <section class="section-head admin-head">
     <div>
-      <h1>Trait administration</h1>
-      <p>Manage the markdown source files behind the public Trait library.</p>
+      <h1>{{if .Workspace}}{{.Workspace.Name}}{{else}}Trait administration{{end}}</h1>
+      <p>{{if .Workspace}}{{.Workspace.Description}}{{else}}Manage workspaces and the markdown source files behind the public Trait library.{{end}}</p>
     </div>
-    <a class="button" href="/admin/new">New trait</a>
+    <div class="admin-head-actions">
+      <details class="import-menu">
+        <summary class="button secondary">Import markdown</summary>
+        <div class="import-panel">
+          <form method="post" action="/admin/import" enctype="multipart/form-data">
+            {{if $.Workspace}}<input type="hidden" name="workspace" value="{{$.Workspace.Slug}}">{{end}}
+            <label>Single trait<input type="file" name="traits" accept=".md,text/markdown" required></label>
+            <button class="button" type="submit">Upload file</button>
+          </form>
+          <form method="post" action="/admin/import" enctype="multipart/form-data">
+            {{if $.Workspace}}<input type="hidden" name="workspace" value="{{$.Workspace.Slug}}">{{end}}
+            <label>Folder of traits<input type="file" name="traits" accept=".md,text/markdown" webkitdirectory directory multiple required></label>
+            <button class="button" type="submit">Upload folder</button>
+          </form>
+          <p>Markdown filenames may repeat. Collisions are renamed automatically.</p>
+        </div>
+      </details>
+      <a class="button" href="/admin/new{{if .Workspace}}?workspace={{.Workspace.Slug}}{{end}}">New trait</a>
+    </div>
   </section>
+  {{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
+  {{if not .Workspace}}
+  <section class="workspace-admin-head"><h2>Workspaces</h2><a class="button secondary" href="/admin/workspaces/new">New workspace</a></section>
+  <section class="workspace-grid">
+    {{range .Workspaces}}<a class="workspace-card" href="/admin/workspaces/{{.Slug}}"><strong>{{.Name}}</strong><p>{{.Description}}</p><span>{{.TraitCount}} traits</span></a>{{else}}<p class="empty">No workspaces yet.</p>{{end}}
+  </section>
+  {{else}}<p><a class="back-link" href="/admin">Back to all workspaces and traits</a> · <a class="back-link" href="/workspaces/{{.Workspace.Slug}}">View public workspace</a></p>{{end}}
   <section class="admin-toolbar" aria-label="Trait administration tools">
     <label>Search traits<input data-trait-search type="search" placeholder="Search title, tag, or markdown" autocomplete="off"></label>
     <span>{{len .Traits}} traits</span>
@@ -1690,16 +2127,16 @@ const templates = `
     {{range .Traits}}
       <article class="admin-row" data-search data-search-text="{{.Title}} {{joinTags .Tags}} {{.Content}}">
         <div class="admin-title">
-          <h2><a href="/traits/{{.Slug}}">{{.Title}}</a></h2>
+          <h2><a href="{{traitPath .}}">{{.Title}}</a></h2>
           <span>{{.Slug}}</span>
         </div>
         {{template "contentTags" .Tags}}
         <time datetime="{{.ModTime}}">{{.ModTime.Format "Jan 2, 2006"}}</time>
         <div class="actions">
-          <a class="button secondary" href="/admin/edit/{{.Slug}}">Edit</a>
+          <a class="button secondary" href="/admin/edit/{{.Slug}}{{if .WorkspaceSlug}}?workspace={{.WorkspaceSlug}}{{end}}">Edit</a>
           <details class="danger-menu">
             <summary aria-label="Delete {{.Title}}">Delete</summary>
-            <form method="post" action="/admin/delete/{{.Slug}}">
+            <form method="post" action="/admin/delete/{{.Slug}}{{if .WorkspaceSlug}}?workspace={{.WorkspaceSlug}}{{end}}">
               <p>Delete <strong>{{.Title}}</strong>? This cannot be undone.</p>
               <button class="danger" type="submit">Confirm delete</button>
             </form>
@@ -1724,8 +2161,19 @@ const templates = `
   <form class="editor" method="post">
     {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
     {{if not .Trait.Slug}}<label>Title<input name="title" value="{{.Trait.Title}}" autocomplete="off"></label>{{end}}
+    {{if .Workspace}}<input type="hidden" name="workspace" value="{{.Workspace.Slug}}">{{end}}
     <label>Markdown<textarea name="content" rows="24">{{.Trait.Content}}</textarea></label>
     <div class="form-actions"><a class="button secondary" href="/admin">Cancel</a><button class="button" type="submit">Save trait</button></div>
+  </form>
+{{template "bottom" .}}{{end}}
+
+{{define "workspaceEdit"}}{{template "top" .}}
+  <section class="section-head edit-head"><div><h1>New workspace</h1><p>Create a one-level collection for related traits.</p></div><a class="button secondary" href="/admin">Cancel</a></section>
+  <form class="editor" method="post">
+    {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+    <label>Name<input name="name" value="{{.Workspace.Name}}" autocomplete="off" required></label>
+    <label>Description<textarea name="description" rows="10" placeholder="Add any context, purpose, instructions, or notes you want people to see.">{{.Workspace.Description}}</textarea></label>
+    <div class="form-actions"><a class="button secondary" href="/admin">Cancel</a><button class="button" type="submit">Create workspace</button></div>
   </form>
 {{template "bottom" .}}{{end}}
 
@@ -2366,6 +2814,40 @@ textarea { line-height: 1.55; }
   margin-left: auto;
   margin-right: auto;
 }
+.admin-head-actions { display: flex; align-items: center; gap: 10px; }
+.import-menu { position: relative; }
+.import-menu > summary { list-style: none; cursor: pointer; }
+.import-menu > summary::-webkit-details-marker { display: none; }
+.import-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(420px, calc(100vw - 32px));
+  padding: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .42);
+}
+.import-panel form { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; }
+.import-panel form + form { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-subtle); }
+.import-panel input[type="file"] { display: block; width: 100%; margin-top: 6px; color: var(--text-secondary); }
+.import-panel p { margin: 12px 0 0; color: var(--text-muted); font-size: .8rem; }
+.notice { margin: 0 auto 18px; padding: 12px 14px; border: 1px solid rgba(54, 215, 131, .35); border-radius: var(--radius-md); background: var(--accent-soft); color: var(--text-primary); }
+.workspace-context, .workspace-links { margin: 0 16px 16px; padding: 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--surface-2); }
+.workspace-context p { margin: 6px 0 10px; color: var(--text-secondary); white-space: pre-wrap; }
+.workspace-links > span { display: block; margin-bottom: 8px; color: var(--text-muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
+.workspace-links a { display: flex; justify-content: space-between; gap: 8px; padding: 8px 0; color: var(--text-primary); }
+.workspace-links small { color: var(--text-muted); }
+.workspace-admin-head { display: flex; align-items: center; justify-content: space-between; margin: 20px 0 10px; }
+.workspace-admin-head h2 { margin: 0; }
+.workspace-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.workspace-card { padding: 16px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--surface-1); color: var(--text-primary); }
+.workspace-card:hover { border-color: var(--border-strong); background: var(--surface-2); }
+.workspace-card strong { font-size: 1.05rem; }
+.workspace-card p { min-height: 2.5em; margin: 8px 0; color: var(--text-secondary); white-space: pre-wrap; }
+.workspace-card span { color: var(--text-muted); font-size: .82rem; }
 .admin-toolbar {
   display: grid;
   grid-template-columns: minmax(260px, 520px) 1fr;
