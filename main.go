@@ -267,6 +267,7 @@ func runServe(args []string) error {
 	mux.HandleFunc("/admin", app.requireAuth(app.adminIndex))
 	mux.HandleFunc("/admin/new", app.requireAuth(app.adminNew))
 	mux.HandleFunc("/admin/import", app.requireAuth(app.adminImport))
+	mux.HandleFunc("/admin/repositories", app.requireAuth(app.adminRepositories))
 	mux.HandleFunc("/admin/workspaces/new", app.requireAuth(app.adminWorkspaceNew))
 	mux.HandleFunc("/admin/repositories/new", app.requireAuth(app.adminWorkspaceNew))
 	mux.HandleFunc("/admin/workspaces/", app.requireAuth(app.adminWorkspace))
@@ -524,6 +525,23 @@ func (a *App) adminIndex(w http.ResponseWriter, r *http.Request) {
 	render(w, "admin", PageData{Config: a.cfg, Traits: traits, Tags: tags, Workspaces: workspaces, Notice: strings.TrimSpace(r.URL.Query().Get("notice")), IsAuthed: true, AdminRoute: true})
 }
 
+func (a *App) adminRepositories(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/admin/repositories" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	workspaces, err := a.loadWorkspaces()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	render(w, "adminRepositories", PageData{Config: a.cfg, Workspaces: workspaces, Notice: strings.TrimSpace(r.URL.Query().Get("notice")), IsAuthed: true, AdminRoute: true})
+}
+
 const (
 	maxImportBytes = 64 << 20
 	maxTraitBytes  = 2 << 20
@@ -595,13 +613,18 @@ func (a *App) adminWorkspaceNew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if _, err := importMarkdownTree(sourceTraits, a.workspaceDir(slug)); err != nil {
+	imported, err := importMarkdownTree(sourceTraits, a.workspaceDir(slug))
+	if err != nil {
 		_ = os.RemoveAll(a.workspaceDir(slug))
 		_, _ = a.db.Exec(`DELETE FROM workspaces WHERE slug = ?`, slug)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin/workspaces/"+slug, http.StatusSeeOther)
+	notice := fmt.Sprintf("Repository cloned and registered. Imported %d trait", imported)
+	if imported != 1 {
+		notice += "s"
+	}
+	http.Redirect(w, r, "/admin/workspaces/"+slug+"?notice="+url.QueryEscape(notice+"."), http.StatusSeeOther)
 }
 
 func cloneGitRepository(repositoryURL, destination string) error {
@@ -1701,7 +1724,7 @@ const templates = `
       </a>
       <nav class="topnav site-nav" aria-label="Primary navigation">
         <a href="/traits">Browse traits</a>
-        {{if .IsAuthed}}<a href="/admin">Admin</a><a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
+        {{if .IsAuthed}}<a href="/admin">Admin</a><a href="/admin/repositories">Repositories</a><a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
       </nav>
       <button class="menu-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-menu" data-menu-open>
         <span></span><span></span><span></span>
@@ -1717,7 +1740,7 @@ const templates = `
     <a href="/">Showcase</a>
     <a href="/traits">Traits</a>
     <a href="/admin">Admin</a>
-    {{if .IsAuthed}}<a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
+    {{if .IsAuthed}}<a href="/admin/repositories">Repositories</a><a href="/logout">Logout</a>{{else}}<a href="/login">Sign in</a>{{end}}
   </nav>
   <main>{{end}}
 
@@ -2308,7 +2331,7 @@ const templates = `
   </section>
   {{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
   {{if not .Workspace}}
-  <section class="workspace-admin-head"><h2>Repositories</h2><a class="button secondary" href="/admin/repositories/new">Register repository</a></section>
+  <section class="workspace-admin-head"><h2>Repositories</h2><span><a class="back-link" href="/admin/repositories">Manage repositories</a> <a class="button secondary" href="/admin/repositories/new">Add repository</a></span></section>
   <section class="workspace-grid">
     {{range .Workspaces}}<a class="workspace-card" href="/admin/workspaces/{{.Slug}}"><strong>{{.Name}}</strong><p>{{.Description}}</p><span>{{.TraitCount}} traits</span></a>{{else}}<p class="empty">No repositories yet.</p>{{end}}
   </section>
@@ -2351,6 +2374,36 @@ const templates = `
   </section>
 {{template "bottom" .}}{{end}}
 
+{{define "adminRepositories"}}{{template "top" .}}
+  <section class="section-head admin-head">
+    <div>
+      <p class="eyebrow">Administration</p>
+      <h1>Repositories</h1>
+      <p>Add a Git repository and clone the Markdown traits from its root <code>./traits</code> folder into the library.</p>
+    </div>
+    <div class="admin-head-actions">
+      <a class="button secondary" href="/admin">Trait administration</a>
+      <a class="button" href="/admin/repositories/new">Add repository</a>
+    </div>
+  </section>
+  {{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
+  <section class="workspace-grid" aria-label="Registered repositories">
+    {{range .Workspaces}}
+      <a class="workspace-card" href="/admin/workspaces/{{.Slug}}">
+        <strong>{{.Name}}</strong>
+        <p>{{if .Description}}{{.Description}}{{else}}{{.RepositoryURL}}{{end}}</p>
+        <span>{{.TraitCount}} traits · Manage repository</span>
+      </a>
+    {{else}}
+      <div class="empty-state">
+        <h2>No repositories registered</h2>
+        <p>Connect a repository to clone and publish the Markdown files in its <code>traits</code> folder.</p>
+        <a class="button" href="/admin/repositories/new">Add your first repository</a>
+      </div>
+    {{end}}
+  </section>
+{{template "bottom" .}}{{end}}
+
 {{define "edit"}}{{template "top" .}}
   <section class="section-head edit-head">
     <div>
@@ -2370,13 +2423,13 @@ const templates = `
 {{template "bottom" .}}{{end}}
 
 {{define "workspaceEdit"}}{{template "top" .}}
-  <section class="section-head edit-head"><div><h1>Register repository</h1><p>The repository will be cloned temporarily and Markdown files from its root <code>./traits</code> folder will be imported.</p></div><a class="button secondary" href="/admin">Cancel</a></section>
+  <section class="section-head edit-head"><div><p class="eyebrow">Repositories</p><h1>Add repository</h1><p>The repository will be cloned temporarily and Markdown files from its root <code>./traits</code> folder will be imported.</p></div><a class="button secondary" href="/admin/repositories">Cancel</a></section>
   <form class="editor" method="post">
     {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
     <label>Repository name<input name="name" value="{{.Workspace.Name}}" autocomplete="off" required></label>
     <label>Git repository URL<input name="repository_url" type="url" value="{{.Workspace.RepositoryURL}}" placeholder="https://github.com/organization/project.git" autocomplete="url" required></label>
     <label>Description<textarea name="description" rows="10" placeholder="Add any context, purpose, instructions, or notes you want people to see.">{{.Workspace.Description}}</textarea></label>
-    <div class="form-actions"><a class="button secondary" href="/admin">Cancel</a><button class="button" type="submit">Clone and register</button></div>
+    <div class="form-actions"><a class="button secondary" href="/admin/repositories">Cancel</a><button class="button" type="submit">Clone and add repository</button></div>
   </form>
 {{template "bottom" .}}{{end}}
 

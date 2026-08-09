@@ -138,6 +138,9 @@ func TestRegisterRepositoryImportsTraitsAndRejectsMissingFolder(t *testing.T) {
 	if res.Code != http.StatusSeeOther {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
+	if location := res.Header().Get("Location"); !strings.Contains(location, "Imported+1+trait") {
+		t.Fatalf("redirect does not confirm clone/import: %s", location)
+	}
 	if _, err := os.Stat(filepath.Join(app.workspaceDir("platform"), "safe-deploy.md")); err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +152,29 @@ func TestRegisterRepositoryImportsTraitsAndRejectsMissingFolder(t *testing.T) {
 	app.adminWorkspaceNew(res, req)
 	if !strings.Contains(res.Body.String(), "does not have a ./traits folder") {
 		t.Fatalf("body=%s", res.Body.String())
+	}
+}
+
+func TestRepositoryAdminPageHasNavigationAndAddAction(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "test.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: Config{TraitsDir: filepath.Join(dir, "traits"), AccentColor: "#35d07f"}, db: db}
+	res := httptest.NewRecorder()
+	app.adminRepositories(res, httptest.NewRequest(http.MethodGet, "/admin/repositories", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	for _, expected := range []string{"Repositories", "/admin/repositories/new", "Add your first repository"} {
+		if !strings.Contains(res.Body.String(), expected) {
+			t.Errorf("repository admin page missing %q", expected)
+		}
 	}
 }
 
