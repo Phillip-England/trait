@@ -35,6 +35,7 @@ const (
 	sessionTTL     = 12 * time.Hour
 	defaultEnvPath = "config/.env"
 	defaultDBPath  = "data/main.sqlite"
+	defaultTraits  = "data/traits"
 )
 
 type Config struct {
@@ -92,6 +93,10 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "dump":
+		if err := runDump(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
 	case "init":
 		if err := runInit(os.Args[2:]); err != nil {
 			log.Fatal(err)
@@ -109,8 +114,40 @@ func main() {
 func usage() {
 	fmt.Println("usage:")
 	fmt.Println("  trait")
+	fmt.Println("  trait dump [directory]")
 	fmt.Println("  trait init")
 	fmt.Println("  trait serve")
+}
+
+func runDump(args []string) error {
+	fs := flag.NewFlagSet("dump", flag.ContinueOnError)
+	force := fs.Bool("force", false, "overwrite an existing TRAIT.md")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := "."
+	if fs.NArg() > 1 {
+		return fmt.Errorf("usage: trait dump [directory]")
+	}
+	if fs.NArg() == 1 {
+		dir = fs.Arg(0)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "TRAIT.md")
+	if !*force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("%s already exists; rerun with -force to replace it", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.WriteFile(path, []byte(traitDumpGuide), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("created %s\n", path)
+	return nil
 }
 
 func runInit(args []string) error {
@@ -132,16 +169,17 @@ func runInit(args []string) error {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(resolveRelative(envDir, "../public/uploads"), 0o755); err != nil {
+	if err := os.MkdirAll(resolveRelative(envDir, "../data/uploads"), 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(resolveRelative(envDir, "../traits"), 0o755); err != nil {
+	if err := os.MkdirAll(resolveRelative(envDir, "../"+defaultTraits), 0o755); err != nil {
 		return err
 	}
 	content := fmt.Sprintf(`ADMIN_USERNAME=admin
 ADMIN_PASSWORD=change-me-now
 SESSION_SECRET=%s
-TRAITS_DIR=../traits
+DB_PATH=../data/main.sqlite
+TRAITS_DIR=../data/traits
 ADDR=:6688
 ACCENT_COLOR=#35d07f
 `, secret)
@@ -175,6 +213,9 @@ func runServe(args []string) error {
 		return err
 	}
 	if err := os.MkdirAll(cfg.TraitsDir, 0o755); err != nil {
+		return err
+	}
+	if err := seedTraitsDir(cfg.TraitsDir); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil {
@@ -228,17 +269,19 @@ func loadConfig(envPath string) (Config, error) {
 		AdminUsername: values["ADMIN_USERNAME"],
 		AdminPassword: values["ADMIN_PASSWORD"],
 		SessionSecret: values["SESSION_SECRET"],
-		DBPath:        filepath.Join(filepath.Dir(base), defaultDBPath),
+		DBPath:        values["DB_PATH"],
 		TraitsDir:     values["TRAITS_DIR"],
 		Addr:          values["ADDR"],
 		AccentColor:   values["ACCENT_COLOR"],
 	}
+	if cfg.DBPath == "" {
+		cfg.DBPath = "../" + defaultDBPath
+	}
+	if cfg.TraitsDir == "" {
+		cfg.TraitsDir = "../" + defaultTraits
+	}
 	if cfg.Addr == "" {
-		if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
-			cfg.Addr = ":" + strings.TrimPrefix(port, ":")
-		} else {
-			cfg.Addr = ":6688"
-		}
+		cfg.Addr = ":6688"
 	}
 	if cfg.AccentColor == "" {
 		cfg.AccentColor = "#35d07f"
@@ -247,13 +290,13 @@ func loadConfig(envPath string) (Config, error) {
 		"ADMIN_USERNAME": cfg.AdminUsername,
 		"ADMIN_PASSWORD": cfg.AdminPassword,
 		"SESSION_SECRET": cfg.SessionSecret,
-		"TRAITS_DIR":     cfg.TraitsDir,
 	}
 	for key, value := range required {
 		if strings.TrimSpace(value) == "" {
 			return Config{}, fmt.Errorf("%s is required in %s", key, envPath)
 		}
 	}
+	cfg.DBPath = resolveRelative(base, cfg.DBPath)
 	cfg.TraitsDir = resolveRelative(base, cfg.TraitsDir)
 	cfg.LogoPath = resolveAssetPath(base, "logo.png")
 	return cfg, nil
@@ -638,6 +681,64 @@ func (a *App) loadTraits() ([]Trait, []string, error) {
 	return traits, tags, nil
 }
 
+func seedTraitsDir(target string) error {
+	empty, err := traitsDirIsEmpty(target)
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return nil
+	}
+	for _, source := range []string{"traits", "/app/seed-traits"} {
+		if samePath(source, target) {
+			continue
+		}
+		if _, err := os.Stat(source); err != nil {
+			continue
+		}
+		return copyMarkdownTree(source, target)
+	}
+	return nil
+}
+
+func traitsDirIsEmpty(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) == 0, nil
+}
+
+func copyMarkdownTree(source, target string) error {
+	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		dest := filepath.Join(target, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(dest, 0o755)
+		}
+		if filepath.Ext(path) != ".md" {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dest, raw, 0o644)
+	})
+}
+
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	return errA == nil && errB == nil && absA == absB
+}
+
 func (a *App) loadTrait(slug string) (Trait, error) {
 	if !validSlug(slug) {
 		return Trait{}, os.ErrNotExist
@@ -673,13 +774,13 @@ func (a *App) readTrait(path string) (Trait, error) {
 	}, nil
 }
 
-var tagRe = regexp.MustCompile(`(^|[\s(])#([A-Za-z0-9][A-Za-z0-9_-]*)`)
+var tagRe = regexp.MustCompile(`#([A-Za-z0-9][A-Za-z0-9_-]*)`)
 
 func tagsFromMarkdown(content string) []string {
 	matches := tagRe.FindAllStringSubmatch(content, -1)
 	seen := map[string]bool{}
 	for _, match := range matches {
-		seen[strings.ToLower(match[2])] = true
+		seen[strings.ToLower(match[1])] = true
 	}
 	tags := make([]string, 0, len(seen))
 	for tag := range seen {
@@ -892,6 +993,104 @@ func uniqueSlug(dir, base string) string {
 		slug = fmt.Sprintf("%s-%d", base, i)
 	}
 }
+
+const traitDumpGuide = `# TRAIT.md
+
+This project uses the trait system to extract reusable implementation patterns from a codebase. A trait is a concise markdown document that describes one repeatable behavior, architecture choice, integration pattern, UI pattern, security control, deployment convention, or developer workflow found in the project.
+
+When an LLM is asked to inspect this project for traits, it should read this file first, inspect the repository, then create a ` + "`./traits`" + ` directory containing one markdown file per trait it finds.
+
+## What Counts As A Trait
+
+A good trait is:
+
+- Specific enough to reuse in another project.
+- Grounded in real files, commands, configuration, or behavior found in this repository.
+- Written as implementation guidance, not as a changelog or generic documentation.
+- Small enough that one trait describes one coherent pattern.
+- Useful to a future LLM or engineer trying to reproduce the same pattern elsewhere.
+
+Examples of traits include:
+
+- Persistent SQLite storage under a project-owned data directory.
+- Docker and Makefile commands that mount runtime directories.
+- Admin authentication with IP-based rate limiting.
+- A mobile navigation drawer with accessible controls.
+- An explicit environment configuration schema.
+- A startup routine that creates required runtime directories.
+
+Do not create traits for one-off details that are not reusable, generated files, vendored dependencies, build artifacts, or secrets.
+
+## Trait File Format
+
+Create traits in ` + "`./traits`" + `. Each trait should be a markdown file named with a lowercase kebab-case slug:
+
+~~~text
+traits/persistent-sqlite-data-directory.md
+traits/mobile-navigation-drawer.md
+traits/docker-runtime-mounts.md
+~~~
+
+Each trait must start with YAML front matter. Put reusable hashtags in the ` + "`hashtags`" + ` list. Hashtags must include the leading ` + "`#`" + ` character so an admin portal can ingest them directly.
+
+~~~markdown
+---
+title: Persistent SQLite Data Directory
+hashtags:
+  - "#sqlite"
+  - "#database"
+  - "#persistence"
+  - "#docker"
+---
+
+# Persistent SQLite Data Directory
+
+## Intent
+
+Describe the reusable pattern in one or two short paragraphs.
+
+## When To Use
+
+Explain the project situations where this trait applies.
+
+## Implementation
+
+Describe the concrete implementation. Include relevant paths, commands, environment variables, schema fields, handlers, components, or configuration names.
+
+## Project Evidence
+
+Reference the files or directories that prove this trait exists in the project.
+
+## Reuse Notes
+
+Explain what another project should copy, adapt, or avoid.
+~~~
+
+Keep the first ` + "`# Heading`" + ` aligned with the front matter title. Use additional markdown hashtags in the body only when they are useful; the canonical tags live in front matter.
+
+## Inspection Workflow For An LLM
+
+1. Read ` + "`TRAIT.md`" + ` completely.
+2. Inspect the project tree with a fast file search.
+3. Read the main application entry points, configuration files, Docker files, package manifests, database setup, UI components, and tests.
+4. Identify repeated or reusable implementation patterns.
+5. Create ` + "`./traits`" + ` if it does not exist.
+6. Write one markdown file per discovered trait using the format above.
+7. Keep every trait grounded in project evidence.
+8. Do not include secrets, credentials, generated databases, local runtime files, dependency directories, or private machine paths.
+
+## Quality Bar
+
+Each trait should teach a future implementation. Prefer concrete details over broad claims:
+
+- Use exact file and directory names when they matter.
+- Name environment variables and commands.
+- Describe startup behavior and failure modes.
+- Mention security boundaries and persistence boundaries.
+- Include enough detail for another LLM to reproduce the pattern without rereading the whole project.
+
+Avoid vague traits such as "uses Go" or "has a website" unless the project contains a distinctive reusable pattern around that technology.
+`
 
 const templates = `
 {{define "top"}}<!doctype html>

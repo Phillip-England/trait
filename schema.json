@@ -19,10 +19,28 @@
       "required": true
     },
     {
+      "name": "DB_PATH",
+      "description": "SQLite database path. Relative paths are resolved from config/.env; use ../data/main.sqlite for Uppr.",
+      "example": "../data/main.sqlite",
+      "required": false
+    },
+    {
       "name": "TRAITS_DIR",
-      "description": "Directory containing trait markdown files. Relative paths are resolved from config/.env.",
-      "example": "../traits",
-      "required": true
+      "description": "Directory containing trait markdown files. Relative paths are resolved from config/.env; use ../data/traits for durable Uppr storage.",
+      "example": "../data/traits",
+      "required": false
+    },
+    {
+      "name": "ADDR",
+      "description": "HTTP listen address. Use :6688 or 0.0.0.0:6688 so the Docker container accepts external traffic.",
+      "example": ":6688",
+      "required": false
+    },
+    {
+      "name": "ACCENT_COLOR",
+      "description": "CSS accent color used by the web interface.",
+      "example": "#35d07f",
+      "required": false
     }
   ]
 }

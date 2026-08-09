@@ -1,5 +1,6 @@
 .env
 *.sqlite
 .smoke/
-config
-data
+config/
+data/
+/trait

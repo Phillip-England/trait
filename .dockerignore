@@ -1,12 +1,11 @@
 .git
 .gitignore
-Dockerfile
-Makefile
 
-config/.env
-data
-public/uploads
+config/
+data/
+public/uploads/
 trait.sqlite
+trait
 
 bin
 dist
