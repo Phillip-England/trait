@@ -72,6 +72,7 @@ type Trait struct {
 	ModTime       time.Time
 	WorkspaceSlug string
 	WorkspaceName string
+	Category      string
 }
 
 type Workspace struct {
@@ -82,19 +83,21 @@ type Workspace struct {
 }
 
 type PageData struct {
-	Config     Config
-	Traits     []Trait
-	Trait      Trait
-	Tags       []string
-	ActiveTag  string
-	Search     string
-	Error      string
-	Notice     string
-	Workspace  Workspace
-	Workspaces []Workspace
-	IsAuthed   bool
-	AdminRoute bool
-	BodyClass  string
+	Config         Config
+	Traits         []Trait
+	Trait          Trait
+	Tags           []string
+	Categories     []string
+	ActiveCategory string
+	ActiveTag      string
+	Search         string
+	Error          string
+	Notice         string
+	Workspace      Workspace
+	Workspaces     []Workspace
+	IsAuthed       bool
+	AdminRoute     bool
+	BodyClass      string
 }
 
 func main() {
@@ -352,6 +355,13 @@ CREATE TABLE IF NOT EXISTS workspaces (
   description TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS trait_categories (
+  workspace_slug TEXT NOT NULL,
+  trait_slug TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (workspace_slug, trait_slug),
+  FOREIGN KEY (workspace_slug) REFERENCES workspaces(slug) ON DELETE CASCADE
+);
 `)
 	return err
 }
@@ -443,7 +453,8 @@ func (a *App) publicWorkspace(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		render(w, "trait", PageData{Config: a.cfg, Workspace: workspace, Traits: traits, Trait: trait, Tags: tags, Search: strings.TrimSpace(r.URL.Query().Get("q")), IsAuthed: a.isAuthed(r), BodyClass: "browser-page detail-page"})
+		categories := traitCategories(traits)
+		render(w, "trait", PageData{Config: a.cfg, Workspace: workspace, Traits: traits, Trait: trait, Tags: tags, Categories: categories, Search: strings.TrimSpace(r.URL.Query().Get("q")), IsAuthed: a.isAuthed(r), BodyClass: "browser-page detail-page"})
 		return
 	}
 	if len(parts) != 1 {
@@ -459,11 +470,20 @@ func (a *App) publicWorkspace(w http.ResponseWriter, r *http.Request) {
 	if search != "" {
 		traits = searchTraits(traits, search)
 	}
+	active := strings.TrimSpace(r.URL.Query().Get("tag"))
+	if active != "" {
+		traits = filterTraits(traits, active)
+	}
+	category := strings.TrimSpace(r.URL.Query().Get("category"))
+	categories := traitCategories(traits)
+	if category != "" {
+		traits = filterTraitsByCategory(traits, category)
+	}
 	var selected Trait
 	if len(traits) > 0 {
 		selected = traits[0]
 	}
-	render(w, "public", PageData{Config: a.cfg, Workspace: workspace, Traits: traits, Trait: selected, Tags: tags, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page"})
+	render(w, "public", PageData{Config: a.cfg, Workspace: workspace, Traits: traits, Trait: selected, Tags: tags, Categories: categories, ActiveCategory: category, ActiveTag: active, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page"})
 }
 
 func (a *App) controls(w http.ResponseWriter, r *http.Request) {
@@ -565,6 +585,7 @@ func (a *App) adminImport(w http.ResponseWriter, r *http.Request) {
 	defer r.MultipartForm.RemoveAll()
 	destination := a.cfg.TraitsDir
 	workspaceSlug := strings.TrimSpace(r.FormValue("workspace"))
+	category := strings.TrimSpace(r.FormValue("category"))
 	if workspaceSlug != "" {
 		workspace, err := a.loadWorkspace(workspaceSlug)
 		if err != nil {
@@ -626,6 +647,16 @@ func (a *App) adminImport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		written = append(written, path)
+		if workspaceSlug != "" {
+			slug := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+			if err := a.setTraitCategory(workspaceSlug, slug, category); err != nil {
+				for _, created := range written {
+					_ = os.Remove(created)
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
 	}
 	notice := fmt.Sprintf("Imported %d trait", len(written))
 	if len(written) != 1 {
@@ -661,12 +692,13 @@ func (a *App) adminNew(w http.ResponseWriter, r *http.Request) {
 	title := strings.TrimSpace(r.FormValue("title"))
 	content := strings.TrimSpace(r.FormValue("content"))
 	workspaceSlug := strings.TrimSpace(r.FormValue("workspace"))
+	category := strings.TrimSpace(r.FormValue("category"))
 	var workspace Workspace
 	if workspaceSlug != "" {
 		workspace, _ = a.loadWorkspace(workspaceSlug)
 	}
 	if title == "" || content == "" {
-		render(w, "edit", PageData{Config: a.cfg, Workspace: workspace, Trait: Trait{Title: title, Content: content}, Error: "Title and markdown are required.", IsAuthed: true, AdminRoute: true})
+		render(w, "edit", PageData{Config: a.cfg, Workspace: workspace, Trait: Trait{Title: title, Content: content, Category: category}, Error: "Title and markdown are required.", IsAuthed: true, AdminRoute: true})
 		return
 	}
 	if !strings.HasPrefix(content, "# ") {
@@ -680,11 +712,18 @@ func (a *App) adminNew(w http.ResponseWriter, r *http.Request) {
 		}
 		destination = a.workspaceDir(workspaceSlug)
 	}
-	if _, err := writeUniqueTrait(destination, slugify(title), []byte(content+"\n")); err != nil {
+	path, err := writeUniqueTrait(destination, slugify(title), []byte(content+"\n"))
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if workspaceSlug != "" {
+		slug := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if err := a.setTraitCategory(workspaceSlug, slug, category); err != nil {
+			_ = os.Remove(path)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		http.Redirect(w, r, "/admin/workspaces/"+workspaceSlug, http.StatusSeeOther)
 		return
 	}
@@ -724,8 +763,10 @@ func (a *App) adminEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	content := strings.TrimSpace(r.FormValue("content"))
+	category := strings.TrimSpace(r.FormValue("category"))
 	if content == "" {
 		trait.Content = content
+		trait.Category = category
 		render(w, "edit", PageData{Config: a.cfg, Workspace: workspace, Trait: trait, Error: "Markdown is required.", IsAuthed: true, AdminRoute: true})
 		return
 	}
@@ -734,6 +775,10 @@ func (a *App) adminEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if workspaceSlug != "" {
+		if err := a.setTraitCategory(workspaceSlug, slug, category); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		http.Redirect(w, r, "/admin/workspaces/"+workspaceSlug, http.StatusSeeOther)
 		return
 	}
@@ -764,6 +809,7 @@ func (a *App) adminDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if workspaceSlug != "" {
+		_, _ = a.db.Exec(`DELETE FROM trait_categories WHERE workspace_slug = ? AND trait_slug = ?`, workspaceSlug, slug)
 		http.Redirect(w, r, "/admin/workspaces/"+workspaceSlug, http.StatusSeeOther)
 		return
 	}
@@ -1021,7 +1067,19 @@ func (a *App) loadWorkspaceTraits(workspace Workspace) ([]Trait, []string, error
 		}
 		traits = append(traits, trait)
 	}
-	sort.Slice(traits, func(i, j int) bool { return strings.ToLower(traits[i].Title) < strings.ToLower(traits[j].Title) })
+	sort.SliceStable(traits, func(i, j int) bool {
+		left, right := strings.ToLower(traits[i].Category), strings.ToLower(traits[j].Category)
+		if left == right {
+			return strings.ToLower(traits[i].Title) < strings.ToLower(traits[j].Title)
+		}
+		if left == "" {
+			return false
+		}
+		if right == "" {
+			return true
+		}
+		return left < right
+	})
 	tagSet := map[string]bool{}
 	for _, trait := range traits {
 		for _, tag := range trait.Tags {
@@ -1130,7 +1188,7 @@ func (a *App) readTraitIn(path string, workspace Workspace) (Trait, error) {
 	if err := a.md.Convert(raw, &buf); err != nil {
 		return Trait{}, err
 	}
-	return Trait{
+	trait := Trait{
 		Slug:          strings.TrimSuffix(filepath.Base(path), ".md"),
 		Title:         title,
 		Content:       content,
@@ -1139,7 +1197,47 @@ func (a *App) readTraitIn(path string, workspace Workspace) (Trait, error) {
 		ModTime:       info.ModTime(),
 		WorkspaceSlug: workspace.Slug,
 		WorkspaceName: workspace.Name,
-	}, nil
+	}
+	if workspace.Slug != "" {
+		_ = a.db.QueryRow(`SELECT category FROM trait_categories WHERE workspace_slug = ? AND trait_slug = ?`, workspace.Slug, trait.Slug).Scan(&trait.Category)
+	}
+	return trait, nil
+}
+
+func (a *App) setTraitCategory(workspaceSlug, traitSlug, category string) error {
+	category = strings.TrimSpace(category)
+	if category == "" {
+		_, err := a.db.Exec(`DELETE FROM trait_categories WHERE workspace_slug = ? AND trait_slug = ?`, workspaceSlug, traitSlug)
+		return err
+	}
+	_, err := a.db.Exec(`INSERT INTO trait_categories (workspace_slug, trait_slug, category) VALUES (?, ?, ?)
+		ON CONFLICT(workspace_slug, trait_slug) DO UPDATE SET category = excluded.category`, workspaceSlug, traitSlug, category)
+	return err
+}
+
+func traitCategories(traits []Trait) []string {
+	seen := map[string]string{}
+	for _, trait := range traits {
+		if value := strings.TrimSpace(trait.Category); value != "" {
+			seen[strings.ToLower(value)] = value
+		}
+	}
+	categories := make([]string, 0, len(seen))
+	for _, value := range seen {
+		categories = append(categories, value)
+	}
+	sort.Slice(categories, func(i, j int) bool { return strings.ToLower(categories[i]) < strings.ToLower(categories[j]) })
+	return categories
+}
+
+func filterTraitsByCategory(traits []Trait, category string) []Trait {
+	var out []Trait
+	for _, trait := range traits {
+		if strings.EqualFold(trait.Category, category) {
+			out = append(out, trait)
+		}
+	}
+	return out
 }
 
 var tagRe = regexp.MustCompile(`#([A-Za-z0-9][A-Za-z0-9_-]*)`)
@@ -1188,7 +1286,7 @@ func searchTraits(traits []Trait, query string) []Trait {
 	}
 	var out []Trait
 	for _, trait := range traits {
-		haystack := strings.ToLower(trait.Title + " " + strings.Join(trait.Tags, " ") + " " + trait.Content)
+		haystack := strings.ToLower(trait.Title + " " + trait.Category + " " + strings.Join(trait.Tags, " ") + " " + trait.Content)
 		if strings.Contains(haystack, query) {
 			out = append(out, trait)
 		}
@@ -1398,30 +1496,39 @@ func writeUniqueTrait(dir, base string, content []byte) (string, error) {
 
 const traitDumpGuide = `# TRAIT.md
 
-This project uses the trait system to extract reusable implementation patterns from a codebase. A trait is a concise markdown document that describes one repeatable behavior, architecture choice, integration pattern, UI pattern, security control, deployment convention, or developer workflow found in the project.
+This project uses traits to turn useful application ideas into portable, English-language artifacts. A trait describes what an application idea does, how people experience it, the rules it preserves, and the outcomes that show it works. It does not prescribe a programming language, framework, database product, file layout, class name, function name, route, or architecture.
 
-When an LLM is asked to inspect this project for traits, it should read this file first, inspect the repository, then create a ` + "`./traits`" + ` directory containing one markdown file per trait it finds.
+When asked to inspect this project for traits, read this file first. Study the implementation as evidence, infer the application-level idea behind it, and write one Markdown file per reusable idea into ` + "`./traits`" + `. The output must make sense to an LLM that receives the trait alongside a completely different codebase.
 
 ## What Counts As A Trait
 
 A good trait is:
 
-- Specific enough to reuse in another project.
-- Grounded in real files, commands, configuration, or behavior found in this repository.
-- Written as implementation guidance, not as a changelog or generic documentation.
-- Small enough that one trait describes one coherent pattern.
-- Useful to a future LLM or engineer trying to reproduce the same pattern elsewhere.
+- a coherent piece of observable application behavior or an application-level operational rule
+- grounded in behavior that really exists in this project
+- independent of the source project's language, framework, storage engine, and architecture
+- explicit about actors, states, transitions, constraints, failure behavior, and user-visible outcomes
+- narrow enough to add to another application without importing unrelated ideas
 
-Examples of traits include:
+Examples include:
 
-- Persistent SQLite storage under a project-owned data directory.
-- Docker and Makefile commands that mount runtime directories.
-- Admin authentication with IP-based rate limiting.
-- A mobile navigation drawer with accessible controls.
-- An explicit environment configuration schema.
-- A startup routine that creates required runtime directories.
+- a login form that temporarily blocks repeated failed attempts from the same network source while allowing public pages to remain available
+- a mobile navigation drawer that opens above content, closes in several predictable ways, and reports its state to assistive technology
+- durable application data that survives restarts and replacement of the running application
+- first-run configuration that creates safe defaults without overwriting an existing installation
 
-Do not create traits for one-off details that are not reusable, generated files, vendored dependencies, build artifacts, or secrets.
+Do not extract incidental implementation choices as traits. “Uses Go,” “has a SQLite table,” “defines a POST route,” and “contains a Dockerfile” are not application ideas. Do not include generated files, vendored dependencies, build artifacts, secrets, private paths, source citations, or archaeology from the original repository in the output.
+
+## Abstraction Rule
+
+Repository details are evidence for the extractor, not instructions for the adopter. Translate them before writing:
+
+- a table of login failures becomes a durable record of failed attempts grouped by a privacy-appropriate client identity
+- a signed cookie and an in-memory map become a time-limited authenticated session that cannot be forged by the client
+- a particular route becomes a protected management area
+- a concrete numeric threshold may remain when it is essential behavior; otherwise describe it as a configurable policy
+
+Name a technology only when that technology is itself the product requirement. Prefer capability language such as “durable local storage” over a product name. Never tell the receiving LLM where to put code. It should inspect its own target codebase and choose the appropriate integration.
 
 ## Trait File Format
 
@@ -1433,65 +1540,64 @@ traits/mobile-navigation-drawer.md
 traits/docker-runtime-mounts.md
 ~~~
 
-Each trait must start with YAML front matter. Put reusable hashtags in the ` + "`hashtags`" + ` list. Hashtags must include the leading ` + "`#`" + ` character so an admin portal can ingest them directly.
+Each trait must start with YAML front matter. Hashtags describe the trait itself and are separate from any workspace category assigned after upload.
 
 ~~~markdown
 ---
-title: Persistent SQLite Data Directory
+title: Temporary Login Blocking After Repeated Failures
 hashtags:
-  - "#sqlite"
-  - "#database"
-  - "#persistence"
-  - "#docker"
+  - "#authentication"
+  - "#security"
+  - "#rate-limiting"
 ---
 
-# Persistent SQLite Data Directory
+# Temporary Login Blocking After Repeated Failures
 
-## Intent
+## Purpose
 
-Describe the reusable pattern in one or two short paragraphs.
+State the application-level capability and the problem it solves.
 
 ## When To Use
 
-Explain the project situations where this trait applies.
+Describe when this behavior is appropriate and when it is not.
 
-## Implementation
+## Behavior
 
-Describe the concrete implementation. Include relevant paths, commands, environment variables, schema fields, handlers, components, or configuration names.
+Describe actors, triggers, state changes, boundaries, and observable results in plain English.
 
-## Project Evidence
+## Rules And Edge Cases
 
-Reference the files or directories that prove this trait exists in the project.
+State security constraints, failure behavior, recovery, accessibility needs, and important edge cases.
 
-## Reuse Notes
+## Acceptance Checks
 
-Explain what another project should copy, adapt, or avoid.
+Give technology-neutral scenarios an implementer can use to confirm the trait works.
 ~~~
 
-Keep the first ` + "`# Heading`" + ` aligned with the front matter title. Use additional markdown hashtags in the body only when they are useful; the canonical tags live in front matter.
+Keep the heading aligned with the title. Write requirements and behavior, not pseudocode. Do not add a category to the file; categories belong to the destination workspace, while hashtags travel with the trait.
 
 ## Inspection Workflow For An LLM
 
 1. Read ` + "`TRAIT.md`" + ` completely.
 2. Inspect the project tree with a fast file search.
-3. Read the main application entry points, configuration files, Docker files, package manifests, database setup, UI components, and tests.
-4. Identify repeated or reusable implementation patterns.
+3. Read entry points, user interfaces, configuration, persistence, security boundaries, background work, deployment behavior, and tests.
+4. List candidate application ideas, including small but meaningful compositions. A login form plus durable failure tracking plus temporary blocking is one coherent trait, even if each piece alone looks ordinary.
 5. Create ` + "`./traits`" + ` if it does not exist.
-6. Write one markdown file per discovered trait using the format above.
-7. Keep every trait grounded in project evidence.
-8. Do not include secrets, credentials, generated databases, local runtime files, dependency directories, or private machine paths.
+6. For each candidate, separate the idea from its current implementation. Ask whether the description would still work in a project using a different language, architecture, and storage mechanism.
+7. Merge candidates that only make sense together; split candidates that can be adopted independently.
+8. Write one file per trait using the format above, then remove all source-project references from the artifact.
 
 ## Quality Bar
 
-Each trait should teach a future implementation. Prefer concrete details over broad claims:
+Each trait should let a capable LLM scan an unfamiliar target codebase and make its own implementation decisions. Prefer precise behavior over either vague prose or source-specific instructions:
 
-- Use exact file and directory names when they matter.
-- Name environment variables and commands.
-- Describe startup behavior and failure modes.
-- Mention security boundaries and persistence boundaries.
-- Include enough detail for another LLM to reproduce the pattern without rereading the whole project.
+- say what initiates the behavior and who can initiate it
+- say what state must persist and for how long, without dictating a storage product
+- describe success, denial, expiry, retry, and recovery behavior
+- preserve security, privacy, accessibility, and data-loss boundaries
+- include acceptance checks phrased as observable scenarios
 
-Avoid vague traits such as "uses Go" or "has a website" unless the project contains a distinctive reusable pattern around that technology.
+Reject a draft if it references original filenames, symbols, routes, schema, packages, commands, or internal architecture; if it merely names a technology; or if an adopter would need the original repository to understand it.
 `
 
 const templates = `
@@ -1867,8 +1973,8 @@ const templates = `
 
 {{define "tags"}}
   <div class="tags">
-    <a class="tag {{if eq .ActiveTag ""}}active{{end}}" href="/traits">all</a>
-    {{range .Tags}}<a class="tag {{if eq $.ActiveTag .}}active{{end}}" href="/traits?tag={{.}}">#{{.}}</a>{{end}}
+    <a class="tag {{if eq .ActiveTag ""}}active{{end}}" href="{{if .Workspace}}/workspaces/{{.Workspace.Slug}}{{else}}/traits{{end}}">all</a>
+    {{range .Tags}}<a class="tag {{if eq $.ActiveTag .}}active{{end}}" href="{{if $.Workspace}}/workspaces/{{$.Workspace.Slug}}{{else}}/traits{{end}}?tag={{.}}">#{{.}}</a>{{end}}
   </div>
 {{end}}
 
@@ -1949,10 +2055,11 @@ const templates = `
       </form>
       {{if .Workspace}}
         <div class="workspace-context"><strong>{{.Workspace.Name}}</strong><p>{{.Workspace.Description}}</p><a href="/traits">Search all workspaces</a></div>
+        {{if .Categories}}<div class="workspace-categories"><span>Categories</span><a class="{{if eq .ActiveCategory ""}}active{{end}}" href="/workspaces/{{.Workspace.Slug}}">All</a>{{range .Categories}}<a class="{{if eq $.ActiveCategory .}}active{{end}}" href="/workspaces/{{$.Workspace.Slug}}?category={{urlquery .}}">{{.}}</a>{{end}}</div>{{end}}
       {{else if .Workspaces}}
         <div class="workspace-links"><span>Workspaces</span>{{range .Workspaces}}<a href="/workspaces/{{.Slug}}"><strong>{{.Name}}</strong><small>{{.TraitCount}} traits</small></a>{{end}}</div>
       {{end}}
-      <div class="filter-head"><span>Tags</span>{{if or .ActiveTag .Search}}<a href="/traits">Reset</a>{{end}}</div>
+      <div class="filter-head"><span>Hashtags</span>{{if or .ActiveTag .Search}}<a href="{{if .Workspace}}/workspaces/{{.Workspace.Slug}}{{else}}/traits{{end}}">Reset</a>{{end}}</div>
       {{template "tags" .}}
     </aside>
     <section class="results-panel" aria-label="Trait results">
@@ -1966,9 +2073,9 @@ const templates = `
       </div>
       <div class="trait-list">
         {{range .Traits}}
-          <article class="trait-list-item {{if eq $.Trait.Slug .Slug}}active{{end}}" data-trait data-search data-slug="{{.Slug}}" data-title="{{.Title}}" data-content="{{.Content}}" data-search-text="{{.Title}} {{joinTags .Tags}} {{.Content}}">
+          <article class="trait-list-item {{if eq $.Trait.Slug .Slug}}active{{end}}" data-trait data-search data-slug="{{.Slug}}" data-title="{{.Title}}" data-content="{{.Content}}" data-search-text="{{.Title}} {{.Category}} {{joinTags .Tags}} {{.Content}}">
             <a class="trait-link" href="{{traitPath .}}">
-              <strong>{{.Title}}</strong>
+              <strong>{{.Title}}</strong>{{if .Category}}<small class="category-label">{{.Category}}</small>{{end}}
               {{template "contentTags" .Tags}}
             </a>
             <button class="icon-button" type="button" data-copy-trait aria-label="Copy {{.Title}}" title="Copy trait">Copy</button>
@@ -1985,6 +2092,7 @@ const templates = `
         <header class="reader-head">
           <a class="back-link" href="{{if .Workspace}}/workspaces/{{.Workspace.Slug}}{{else}}{{libraryURL .ActiveTag .Search}}{{end}}">Back to library</a>
           <h1>{{.Trait.Title}}</h1>
+          {{if .Trait.Category}}<p class="category-label">Category: {{.Trait.Category}}</p>{{end}}
           {{template "contentTags" .Trait.Tags}}
           <div>
             <button class="button secondary select-toggle" type="button" data-cart-toggle aria-pressed="false">Select trait</button>
@@ -2091,11 +2199,13 @@ const templates = `
         <div class="import-panel">
           <form method="post" action="/admin/import" enctype="multipart/form-data">
             {{if $.Workspace}}<input type="hidden" name="workspace" value="{{$.Workspace.Slug}}">{{end}}
+            {{if $.Workspace}}<label>Workspace category<input name="category" placeholder="For example: Security"></label>{{end}}
             <label>Single trait<input type="file" name="traits" accept=".md,text/markdown" required></label>
             <button class="button" type="submit">Upload file</button>
           </form>
           <form method="post" action="/admin/import" enctype="multipart/form-data">
             {{if $.Workspace}}<input type="hidden" name="workspace" value="{{$.Workspace.Slug}}">{{end}}
+            {{if $.Workspace}}<label>Workspace category<input name="category" placeholder="Applied to every uploaded trait"></label>{{end}}
             <label>Folder of traits<input type="file" name="traits" accept=".md,text/markdown" webkitdirectory directory multiple required></label>
             <button class="button" type="submit">Upload folder</button>
           </form>
@@ -2122,7 +2232,7 @@ const templates = `
   </details>
   <section class="admin-list" aria-label="Admin trait list">
     <div class="admin-row admin-row-head" aria-hidden="true">
-      <span>Trait</span><span>Tags</span><span>Updated</span><span>Actions</span>
+      <span>Trait</span><span>{{if .Workspace}}Category / tags{{else}}Tags{{end}}</span><span>Updated</span><span>Actions</span>
     </div>
     {{range .Traits}}
       <article class="admin-row" data-search data-search-text="{{.Title}} {{joinTags .Tags}} {{.Content}}">
@@ -2130,7 +2240,7 @@ const templates = `
           <h2><a href="{{traitPath .}}">{{.Title}}</a></h2>
           <span>{{.Slug}}</span>
         </div>
-        {{template "contentTags" .Tags}}
+        <div>{{if .Category}}<span class="category-label">{{.Category}}</span>{{end}}{{template "contentTags" .Tags}}</div>
         <time datetime="{{.ModTime}}">{{.ModTime.Format "Jan 2, 2006"}}</time>
         <div class="actions">
           <a class="button secondary" href="/admin/edit/{{.Slug}}{{if .WorkspaceSlug}}?workspace={{.WorkspaceSlug}}{{end}}">Edit</a>
@@ -2154,7 +2264,7 @@ const templates = `
   <section class="section-head edit-head">
     <div>
       <h1>{{if .Trait.Slug}}Edit trait{{else}}New trait{{end}}</h1>
-      <p>Write the reusable guidance in markdown. Tags can be added inline with #tag-name.</p>
+      <p>Write portable application behavior in markdown. Hashtags travel with the trait; workspace categories stay separate.</p>
     </div>
     <a class="button secondary" href="/admin">Cancel</a>
   </section>
@@ -2162,6 +2272,7 @@ const templates = `
     {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
     {{if not .Trait.Slug}}<label>Title<input name="title" value="{{.Trait.Title}}" autocomplete="off"></label>{{end}}
     {{if .Workspace}}<input type="hidden" name="workspace" value="{{.Workspace.Slug}}">{{end}}
+    {{if .Workspace}}<label>Workspace category<input name="category" value="{{.Trait.Category}}" placeholder="For example: Security"></label>{{end}}
     <label>Markdown<textarea name="content" rows="24">{{.Trait.Content}}</textarea></label>
     <div class="form-actions"><a class="button secondary" href="/admin">Cancel</a><button class="button" type="submit">Save trait</button></div>
   </form>
@@ -2840,6 +2951,11 @@ textarea { line-height: 1.55; }
 .workspace-links > span { display: block; margin-bottom: 8px; color: var(--text-muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
 .workspace-links a { display: flex; justify-content: space-between; gap: 8px; padding: 8px 0; color: var(--text-primary); }
 .workspace-links small { color: var(--text-muted); }
+.workspace-categories { margin: 0 16px 16px; padding: 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+.workspace-categories > span { display: block; margin-bottom: 8px; color: var(--text-muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
+.workspace-categories a { display: inline-block; margin: 0 6px 6px 0; padding: 5px 9px; border-radius: 999px; background: var(--surface-2); color: var(--text-secondary); font-size: .8rem; }
+.workspace-categories a.active { background: var(--accent); color: #07140d; }
+.category-label { display: inline-block; margin: 5px 0; color: var(--accent); font-size: .78rem; font-weight: 700; letter-spacing: .03em; }
 .workspace-admin-head { display: flex; align-items: center; justify-content: space-between; margin: 20px 0 10px; }
 .workspace-admin-head h2 { margin: 0; }
 .workspace-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 24px; }

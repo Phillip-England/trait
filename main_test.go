@@ -97,17 +97,47 @@ func TestWorkspaceCreationAndPublicSearch(t *testing.T) {
 	if _, err := writeUniqueTrait(app.workspaceDir(workspace.Slug), "deploy-safely", []byte("# Deploy Safely\n\n#release\n")); err != nil {
 		t.Fatal(err)
 	}
+	if err := app.setTraitCategory(workspace.Slug, "deploy-safely", "Operations"); err != nil {
+		t.Fatal(err)
+	}
 
-	publicReq := httptest.NewRequest(http.MethodGet, "/workspaces/platform-ideas?q=deploy", nil)
+	publicReq := httptest.NewRequest(http.MethodGet, "/workspaces/platform-ideas?q=deploy&category=Operations", nil)
 	publicRes := httptest.NewRecorder()
 	app.publicWorkspace(publicRes, publicReq)
 	if publicRes.Code != http.StatusOK {
 		t.Fatalf("public workspace: status=%d body=%s", publicRes.Code, publicRes.Body.String())
 	}
-	for _, expected := range []string{"Platform Ideas", "Notes for the platform", "Deploy Safely"} {
+	for _, expected := range []string{"Platform Ideas", "Notes for the platform", "Deploy Safely", "Operations", "#release"} {
 		if !strings.Contains(publicRes.Body.String(), expected) {
 			t.Errorf("public workspace missing %q", expected)
 		}
+	}
+}
+
+func TestTraitDumpGuideRequiresPortableBehavior(t *testing.T) {
+	for _, expected := range []string{"different codebase", "application-level idea", "Acceptance Checks", "categories belong to the destination workspace"} {
+		if !strings.Contains(traitDumpGuide, expected) {
+			t.Errorf("dump guide missing %q", expected)
+		}
+	}
+	for _, rejected := range []string{"## Implementation\n", "## Project Evidence\n"} {
+		if strings.Contains(traitDumpGuide, rejected) {
+			t.Errorf("dump guide still requires source-specific section %q", rejected)
+		}
+	}
+}
+
+func TestWorkspaceCategoryTemplateRenders(t *testing.T) {
+	res := httptest.NewRecorder()
+	render(res, "public", PageData{
+		Config:         Config{AccentColor: "#35d07f"},
+		Workspace:      Workspace{Slug: "product", Name: "Product"},
+		Categories:     []string{"User experience"},
+		ActiveCategory: "User experience",
+		Traits:         []Trait{{Slug: "clear-errors", Title: "Clear Errors", Category: "User experience"}},
+	})
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), "User experience") {
+		t.Fatalf("category template did not render: status=%d body=%s", res.Code, res.Body.String())
 	}
 }
 
