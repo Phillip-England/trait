@@ -83,12 +83,12 @@ func TestWorkspaceCreationAndPublicSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/workspaces/new", strings.NewReader("name=Platform+Ideas&description=Notes+for+the+platform"))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	res := httptest.NewRecorder()
-	app.adminWorkspaceNew(res, req)
-	if res.Code != http.StatusSeeOther || res.Header().Get("Location") != "/admin/workspaces/platform-ideas" {
-		t.Fatalf("workspace creation: status=%d location=%q body=%s", res.Code, res.Header().Get("Location"), res.Body.String())
+	_, err = db.Exec(`INSERT INTO workspaces (slug, name, description, repository_url, created_at) VALUES ('platform-ideas', 'Platform Ideas', 'Notes for the platform', 'https://example.com/platform.git', 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(app.workspaceDir("platform-ideas"), 0o755); err != nil {
+		t.Fatal(err)
 	}
 	workspace, err := app.loadWorkspace("platform-ideas")
 	if err != nil {
@@ -111,6 +111,80 @@ func TestWorkspaceCreationAndPublicSearch(t *testing.T) {
 		if !strings.Contains(publicRes.Body.String(), expected) {
 			t.Errorf("public workspace missing %q", expected)
 		}
+	}
+}
+
+func TestRegisterRepositoryImportsTraitsAndRejectsMissingFolder(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "test.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: Config{TraitsDir: filepath.Join(dir, "traits"), AccentColor: "#35d07f"}, db: db, md: goldmark.New()}
+	app.cloneRepository = func(_ string, destination string) error {
+		if err := os.MkdirAll(filepath.Join(destination, "traits", "nested"), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(destination, "traits", "nested", "safe-deploy.md"), []byte("# Safe Deploy\n\n#release"), 0o644)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/repositories/new", strings.NewReader("name=Platform&repository_url=https%3A%2F%2Fexample.com%2Fplatform.git"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res := httptest.NewRecorder()
+	app.adminWorkspaceNew(res, req)
+	if res.Code != http.StatusSeeOther {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(app.workspaceDir("platform"), "safe-deploy.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	app.cloneRepository = func(_ string, destination string) error { return os.MkdirAll(destination, 0o755) }
+	req = httptest.NewRequest(http.MethodPost, "/admin/repositories/new", strings.NewReader("name=Empty&repository_url=https%3A%2F%2Fexample.com%2Fempty.git"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res = httptest.NewRecorder()
+	app.adminWorkspaceNew(res, req)
+	if !strings.Contains(res.Body.String(), "does not have a ./traits folder") {
+		t.Fatalf("body=%s", res.Body.String())
+	}
+}
+
+func TestPublicLibraryShowsRepositoriesUntilSearch(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite3", filepath.Join(dir, "test.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{cfg: Config{TraitsDir: filepath.Join(dir, "traits"), AccentColor: "#35d07f"}, db: db, md: goldmark.New()}
+	if err := os.MkdirAll(app.cfg.TraitsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO workspaces (slug, name, description, repository_url, created_at) VALUES ('source', 'Source Repo', '', 'https://example.com/source.git', 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(app.workspaceDir("source"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.workspaceDir("source"), "hidden.md"), []byte("# Hidden Trait\n\nneedle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	app.publicTraits(res, httptest.NewRequest(http.MethodGet, "/traits", nil))
+	if strings.Contains(res.Body.String(), "Hidden Trait") || !strings.Contains(res.Body.String(), "Source Repo") {
+		t.Fatalf("body=%s", res.Body.String())
+	}
+	res = httptest.NewRecorder()
+	app.publicTraits(res, httptest.NewRequest(http.MethodGet, "/traits?q=needle", nil))
+	if !strings.Contains(res.Body.String(), "Hidden Trait") {
+		t.Fatalf("body=%s", res.Body.String())
 	}
 }
 

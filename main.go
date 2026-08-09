@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -51,11 +53,12 @@ type Config struct {
 }
 
 type App struct {
-	cfg      Config
-	db       *sql.DB
-	sessions *SessionStore
-	md       goldmark.Markdown
-	importMu sync.Mutex
+	cfg             Config
+	db              *sql.DB
+	sessions        *SessionStore
+	md              goldmark.Markdown
+	importMu        sync.Mutex
+	cloneRepository func(string, string) error
 }
 
 type SessionStore struct {
@@ -76,10 +79,11 @@ type Trait struct {
 }
 
 type Workspace struct {
-	Slug        string
-	Name        string
-	Description string
-	TraitCount  int
+	Slug          string
+	Name          string
+	Description   string
+	RepositoryURL string
+	TraitCount    int
 }
 
 type PageData struct {
@@ -264,6 +268,7 @@ func runServe(args []string) error {
 	mux.HandleFunc("/admin/new", app.requireAuth(app.adminNew))
 	mux.HandleFunc("/admin/import", app.requireAuth(app.adminImport))
 	mux.HandleFunc("/admin/workspaces/new", app.requireAuth(app.adminWorkspaceNew))
+	mux.HandleFunc("/admin/repositories/new", app.requireAuth(app.adminWorkspaceNew))
 	mux.HandleFunc("/admin/workspaces/", app.requireAuth(app.adminWorkspace))
 	mux.HandleFunc("/admin/edit/", app.requireAuth(app.adminEdit))
 	mux.HandleFunc("/admin/delete/", app.requireAuth(app.adminDelete))
@@ -353,6 +358,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
   slug TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
+  repository_url TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trait_categories (
@@ -363,7 +369,14 @@ CREATE TABLE IF NOT EXISTS trait_categories (
   FOREIGN KEY (workspace_slug) REFERENCES workspaces(slug) ON DELETE CASCADE
 );
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// Existing installations predate repository-backed workspaces.
+	if _, err := db.Exec(`ALTER TABLE workspaces ADD COLUMN repository_url TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	return nil
 }
 
 func (a *App) showcase(w http.ResponseWriter, r *http.Request) {
@@ -371,17 +384,27 @@ func (a *App) showcase(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	traits, tags, err := a.loadTraits()
+	workspaces, err := a.loadWorkspaces()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	render(w, "showcase", PageData{Config: a.cfg, Traits: traits, Trait: featuredTrait(traits), Tags: tags, IsAuthed: a.isAuthed(r), BodyClass: "showcase-page"})
+	render(w, "showcase", PageData{Config: a.cfg, Workspaces: workspaces, IsAuthed: a.isAuthed(r), BodyClass: "showcase-page"})
 }
 
 func (a *App) publicTraits(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/traits" {
 		http.NotFound(w, r)
+		return
+	}
+	workspaces, err := a.loadWorkspaces()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	if search == "" {
+		render(w, "repositories", PageData{Config: a.cfg, Workspaces: workspaces, IsAuthed: a.isAuthed(r)})
 		return
 	}
 	traits, tags, err := a.loadTraits()
@@ -390,20 +413,13 @@ func (a *App) publicTraits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	active := strings.TrimSpace(r.URL.Query().Get("tag"))
+	traits = searchTraits(traits, search)
 	if active != "" {
 		traits = filterTraits(traits, active)
-	}
-	search := strings.TrimSpace(r.URL.Query().Get("q"))
-	if search != "" {
-		traits = searchTraits(traits, search)
 	}
 	var selected Trait
 	if len(traits) > 0 {
 		selected = traits[0]
-	}
-	workspaces, _ := a.loadWorkspaces()
-	if search != "" {
-		workspaces = searchWorkspaces(workspaces, search)
 	}
 	render(w, "public", PageData{Config: a.cfg, Traits: traits, Trait: selected, Tags: tags, Workspaces: workspaces, ActiveTag: active, Search: search, IsAuthed: a.isAuthed(r), BodyClass: "browser-page"})
 }
@@ -529,14 +545,42 @@ func (a *App) adminWorkspaceNew(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimSpace(r.FormValue("name"))
 	description := strings.TrimSpace(r.FormValue("description"))
-	if name == "" {
-		render(w, "workspaceEdit", PageData{Config: a.cfg, Workspace: Workspace{Name: name, Description: description}, Error: "A workspace name is required.", IsAuthed: true, AdminRoute: true})
+	repositoryURL := strings.TrimSpace(r.FormValue("repository_url"))
+	draft := Workspace{Name: name, Description: description, RepositoryURL: repositoryURL}
+	if name == "" || repositoryURL == "" {
+		render(w, "workspaceEdit", PageData{Config: a.cfg, Workspace: draft, Error: "A repository name and Git URL are required.", IsAuthed: true, AdminRoute: true})
+		return
+	}
+	parsed, err := url.Parse(repositoryURL)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		render(w, "workspaceEdit", PageData{Config: a.cfg, Workspace: draft, Error: "Enter a valid HTTP or HTTPS Git repository URL.", IsAuthed: true, AdminRoute: true})
+		return
+	}
+	tempDir, err := os.MkdirTemp("", "trait-repository-*")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer os.RemoveAll(tempDir)
+	cloneDir := filepath.Join(tempDir, "repository")
+	clone := a.cloneRepository
+	if clone == nil {
+		clone = cloneGitRepository
+	}
+	if err := clone(repositoryURL, cloneDir); err != nil {
+		render(w, "workspaceEdit", PageData{Config: a.cfg, Workspace: draft, Error: "Could not clone repository: " + err.Error(), IsAuthed: true, AdminRoute: true})
+		return
+	}
+	sourceTraits := filepath.Join(cloneDir, "traits")
+	info, err := os.Stat(sourceTraits)
+	if err != nil || !info.IsDir() {
+		render(w, "workspaceEdit", PageData{Config: a.cfg, Workspace: draft, Error: "This repository does not have a ./traits folder.", IsAuthed: true, AdminRoute: true})
 		return
 	}
 	base := slugify(name)
 	slug := base
 	for i := 2; ; i++ {
-		_, err := a.db.Exec(`INSERT INTO workspaces (slug, name, description, created_at) VALUES (?, ?, ?, ?)`, slug, name, description, time.Now().Unix())
+		_, err := a.db.Exec(`INSERT INTO workspaces (slug, name, description, repository_url, created_at) VALUES (?, ?, ?, ?, ?)`, slug, name, description, repositoryURL, time.Now().Unix())
 		if err == nil {
 			break
 		}
@@ -551,7 +595,31 @@ func (a *App) adminWorkspaceNew(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if _, err := importMarkdownTree(sourceTraits, a.workspaceDir(slug)); err != nil {
+		_ = os.RemoveAll(a.workspaceDir(slug))
+		_, _ = a.db.Exec(`DELETE FROM workspaces WHERE slug = ?`, slug)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/admin/workspaces/"+slug, http.StatusSeeOther)
+}
+
+func cloneGitRepository(repositoryURL, destination string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--single-branch", "--", repositoryURL, destination)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return errors.New("clone timed out")
+	}
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message != "" {
+			return errors.New(message)
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *App) adminWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -973,20 +1041,6 @@ func (a *App) failureCount(ip string) (int, error) {
 
 func (a *App) loadTraits() ([]Trait, []string, error) {
 	var traits []Trait
-	entries, err := os.ReadDir(a.cfg.TraitsDir)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
-			continue
-		}
-		trait, err := a.readTrait(filepath.Join(a.cfg.TraitsDir, entry.Name()))
-		if err != nil {
-			return nil, nil, err
-		}
-		traits = append(traits, trait)
-	}
 	workspaces, err := a.loadWorkspaces()
 	if err != nil {
 		return nil, nil, err
@@ -1020,7 +1074,7 @@ func (a *App) workspaceDir(slug string) string {
 }
 
 func (a *App) loadWorkspaces() ([]Workspace, error) {
-	rows, err := a.db.Query(`SELECT slug, name, description FROM workspaces ORDER BY lower(name)`)
+	rows, err := a.db.Query(`SELECT slug, name, description, repository_url FROM workspaces ORDER BY lower(name)`)
 	if err != nil {
 		return nil, err
 	}
@@ -1028,7 +1082,7 @@ func (a *App) loadWorkspaces() ([]Workspace, error) {
 	var workspaces []Workspace
 	for rows.Next() {
 		var workspace Workspace
-		if err := rows.Scan(&workspace.Slug, &workspace.Name, &workspace.Description); err != nil {
+		if err := rows.Scan(&workspace.Slug, &workspace.Name, &workspace.Description, &workspace.RepositoryURL); err != nil {
 			return nil, err
 		}
 		entries, _ := os.ReadDir(a.workspaceDir(workspace.Slug))
@@ -1044,8 +1098,36 @@ func (a *App) loadWorkspaces() ([]Workspace, error) {
 
 func (a *App) loadWorkspace(slug string) (Workspace, error) {
 	var workspace Workspace
-	err := a.db.QueryRow(`SELECT slug, name, description FROM workspaces WHERE slug = ?`, slug).Scan(&workspace.Slug, &workspace.Name, &workspace.Description)
+	err := a.db.QueryRow(`SELECT slug, name, description, repository_url FROM workspaces WHERE slug = ?`, slug).Scan(&workspace.Slug, &workspace.Name, &workspace.Description, &workspace.RepositoryURL)
 	return workspace, err
+}
+
+// importMarkdownTree absorbs every Markdown file below a repository's traits
+// directory into the repository's flat, collision-safe trait collection.
+func importMarkdownTree(source, target string) (int, error) {
+	count := 0
+	err := filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		base := slugify(strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())))
+		if title := titleFromMarkdown(string(raw)); title != "" {
+			base = slugify(title)
+		}
+		if _, err := writeUniqueTrait(target, base, raw); err != nil {
+			return err
+		}
+		count++
+		return nil
+	})
+	return count, err
 }
 
 func (a *App) loadWorkspaceTraits(workspace Workspace) ([]Trait, []string, error) {
@@ -1987,26 +2069,22 @@ const templates = `
 {{define "showcase"}}{{template "top" .}}
   <section class="showcase-hero hero">
     <div class="showcase-copy hero-copy">
-      <p class="eyebrow">Trait library for application patterns</p>
-      <h1 class="hero-title">Reusable patterns for better applications.</h1>
-      <p class="hero-description">A focused library of reusable implementation patterns for building application infrastructure, UI shells, deployment workflows, and operational guardrails.</p>
+      <p class="eyebrow">Repository-powered trait library</p>
+      <h1 class="hero-title">Patterns, organized by their source.</h1>
+      <p class="hero-description">Explore registered repositories and the reusable application traits they publish.</p>
       <div class="hero-actions">
-        <a class="button" href="/traits">Browse traits</a>
-        {{if .Trait.Slug}}<a class="text-link" href="{{traitPath .Trait}}">View featured trait</a>{{end}}
+        <a class="button" href="/traits">Browse repositories</a>
       </div>
     </div>
     <div class="showcase-panel featured-trait-card" aria-label="Featured trait preview">
       <div class="panel-head featured-trait-header">
-        <span>Featured trait</span>
-        {{if .Trait.Slug}}<a href="{{traitPath .Trait}}">Read trait</a>{{end}}
+        <span>Registered repositories</span>
       </div>
       <div class="featured-trait featured-trait-body">
-        {{if .Trait.Slug}}
-          {{template "contentTags" .Trait.Tags}}
-          <h2 class="featured-trait-title">{{.Trait.Title}}</h2>
-          <p>Reusable guidance stored as markdown, ready to read, select, and copy into an implementation brief.</p>
-          <div class="featured-meta"><span>Markdown source</span><span>{{len .Trait.Tags}} tags</span></div>
-          <a class="button secondary" href="{{traitPath .Trait}}">Open trait</a>
+        {{if .Workspaces}}
+          <h2 class="featured-trait-title">{{len .Workspaces}} sources available</h2>
+          <p>Open a repository to browse its traits, or search across every registered source.</p>
+          <a class="button secondary" href="/traits">View repositories</a>
         {{else}}
           <p class="empty">No traits have been published yet.</p>
         {{end}}
@@ -2032,13 +2110,26 @@ const templates = `
   </section>
 {{template "bottom" .}}{{end}}
 
+{{define "repositories"}}{{template "top" .}}
+  <section class="section-head">
+    <div><p class="eyebrow">Library</p><h1>Repositories</h1><p>Choose a repository to view its traits, or search across every repository.</p></div>
+  </section>
+  <form class="search repository-search" method="get" action="/traits">
+    <label>Search all traits<input name="q" type="search" placeholder="Enter keywords, tags, or text" autocomplete="off" required></label>
+    <button class="button" type="submit">Search traits</button>
+  </form>
+  <section class="workspace-grid" aria-label="Repositories">
+    {{range .Workspaces}}<a class="workspace-card" href="/workspaces/{{.Slug}}"><strong>{{.Name}}</strong><p>{{.Description}}</p><span>{{.TraitCount}} traits</span></a>{{else}}<p class="empty">No repositories have been registered yet.</p>{{end}}
+  </section>
+{{template "bottom" .}}{{end}}
+
 {{define "browser"}}
   <section class="browser-shell">
     <div class="browser-toolbar">
       <div>
         <p class="eyebrow">Library</p>
-        <h1>Traits</h1>
-        <p>Search, read, select, and copy reusable application traits.</p>
+        <h1>{{if .Workspace}}{{.Workspace.Name}}{{else}}Search results{{end}}</h1>
+        <p>{{if .Workspace}}Browse the traits published by this repository.{{else}}Matching traits from all registered repositories.{{end}}</p>
       </div>
       <a class="controls-link" href="/controls">Controls</a>
     </div>
@@ -2217,9 +2308,9 @@ const templates = `
   </section>
   {{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
   {{if not .Workspace}}
-  <section class="workspace-admin-head"><h2>Workspaces</h2><a class="button secondary" href="/admin/workspaces/new">New workspace</a></section>
+  <section class="workspace-admin-head"><h2>Repositories</h2><a class="button secondary" href="/admin/repositories/new">Register repository</a></section>
   <section class="workspace-grid">
-    {{range .Workspaces}}<a class="workspace-card" href="/admin/workspaces/{{.Slug}}"><strong>{{.Name}}</strong><p>{{.Description}}</p><span>{{.TraitCount}} traits</span></a>{{else}}<p class="empty">No workspaces yet.</p>{{end}}
+    {{range .Workspaces}}<a class="workspace-card" href="/admin/workspaces/{{.Slug}}"><strong>{{.Name}}</strong><p>{{.Description}}</p><span>{{.TraitCount}} traits</span></a>{{else}}<p class="empty">No repositories yet.</p>{{end}}
   </section>
   {{else}}<p><a class="back-link" href="/admin">Back to all workspaces and traits</a> · <a class="back-link" href="/workspaces/{{.Workspace.Slug}}">View public workspace</a></p>{{end}}
   <section class="admin-toolbar" aria-label="Trait administration tools">
@@ -2279,12 +2370,13 @@ const templates = `
 {{template "bottom" .}}{{end}}
 
 {{define "workspaceEdit"}}{{template "top" .}}
-  <section class="section-head edit-head"><div><h1>New workspace</h1><p>Create a one-level collection for related traits.</p></div><a class="button secondary" href="/admin">Cancel</a></section>
+  <section class="section-head edit-head"><div><h1>Register repository</h1><p>The repository will be cloned temporarily and Markdown files from its root <code>./traits</code> folder will be imported.</p></div><a class="button secondary" href="/admin">Cancel</a></section>
   <form class="editor" method="post">
     {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-    <label>Name<input name="name" value="{{.Workspace.Name}}" autocomplete="off" required></label>
+    <label>Repository name<input name="name" value="{{.Workspace.Name}}" autocomplete="off" required></label>
+    <label>Git repository URL<input name="repository_url" type="url" value="{{.Workspace.RepositoryURL}}" placeholder="https://github.com/organization/project.git" autocomplete="url" required></label>
     <label>Description<textarea name="description" rows="10" placeholder="Add any context, purpose, instructions, or notes you want people to see.">{{.Workspace.Description}}</textarea></label>
-    <div class="form-actions"><a class="button secondary" href="/admin">Cancel</a><button class="button" type="submit">Create workspace</button></div>
+    <div class="form-actions"><a class="button secondary" href="/admin">Cancel</a><button class="button" type="submit">Clone and register</button></div>
   </form>
 {{template "bottom" .}}{{end}}
 

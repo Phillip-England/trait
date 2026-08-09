@@ -7,7 +7,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/trait .
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends ca-certificates \
+	&& apt-get install -y --no-install-recommends ca-certificates git \
 	&& rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/trait /usr/local/bin/trait
