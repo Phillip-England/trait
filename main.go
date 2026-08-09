@@ -36,6 +36,7 @@ const (
 	defaultEnvPath = "config/.env"
 	defaultDBPath  = "data/main.sqlite"
 	defaultTraits  = "data/traits"
+	defaultAddr    = ":6688"
 )
 
 type Config struct {
@@ -45,7 +46,6 @@ type Config struct {
 	DBPath        string
 	TraitsDir     string
 	LogoPath      string
-	Addr          string
 	AccentColor   string
 }
 
@@ -180,7 +180,6 @@ ADMIN_PASSWORD=change-me-now
 SESSION_SECRET=%s
 DB_PATH=../data/main.sqlite
 TRAITS_DIR=../data/traits
-ADDR=:6688
 ACCENT_COLOR=#35d07f
 `, secret)
 	if _, err := os.Stat(*envPath); err == nil {
@@ -251,8 +250,8 @@ func runServe(args []string) error {
 	mux.HandleFunc("/assets/logo-nav.png", app.navLogo)
 	mux.HandleFunc("/assets/style.css", app.styles)
 
-	log.Printf("trait listening on %s", cfg.Addr)
-	return http.ListenAndServe(cfg.Addr, securityHeaders(mux))
+	log.Printf("trait listening on %s", defaultAddr)
+	return http.ListenAndServe(defaultAddr, securityHeaders(mux))
 }
 
 func loadConfig(envPath string) (Config, error) {
@@ -271,7 +270,6 @@ func loadConfig(envPath string) (Config, error) {
 		SessionSecret: values["SESSION_SECRET"],
 		DBPath:        values["DB_PATH"],
 		TraitsDir:     values["TRAITS_DIR"],
-		Addr:          values["ADDR"],
 		AccentColor:   values["ACCENT_COLOR"],
 	}
 	if cfg.DBPath == "" {
@@ -279,9 +277,6 @@ func loadConfig(envPath string) (Config, error) {
 	}
 	if cfg.TraitsDir == "" {
 		cfg.TraitsDir = "../" + defaultTraits
-	}
-	if cfg.Addr == "" {
-		cfg.Addr = ":6688"
 	}
 	if cfg.AccentColor == "" {
 		cfg.AccentColor = "#35d07f"

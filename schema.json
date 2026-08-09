@@ -31,12 +31,6 @@
       "required": false
     },
     {
-      "name": "ADDR",
-      "description": "HTTP listen address. Use :6688 or 0.0.0.0:6688 so the Docker container accepts external traffic.",
-      "example": ":6688",
-      "required": false
-    },
-    {
       "name": "ACCENT_COLOR",
       "description": "CSS accent color used by the web interface.",
       "example": "#35d07f",
